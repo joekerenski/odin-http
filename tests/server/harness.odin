@@ -216,3 +216,13 @@ raw_recv :: proc(r: Raw, wait: time.Duration, allocator := context.temp_allocato
 raw_close :: proc(r: Raw) {
 	net.close(r.sock)
 }
+
+// Stops the server from another thread (for tests that need to interact while it shuts down).
+thread_start_stop :: proc(ts: ^Test_Server) -> ^thread.Thread {
+	return thread.create_and_start_with_poly_data(ts, proc(ts: ^Test_Server) { server_stop(ts) }, context)
+}
+
+thread_join_stop :: proc(th: ^thread.Thread) {
+	thread.join(th)
+	thread.destroy(th)
+}

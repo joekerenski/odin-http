@@ -314,6 +314,8 @@ _server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
 				} else {
 					log.debugf("shutdown: connection %i still active", sock)
 				}
+			case .Hijacked:
+				hijacked_on_server_shutdown(conn, force && !forced)
 			case .New, .Idle, .Pending:
 				log.debugf("shutdown: closing connection %i", sock)
 				connection_close(conn)
@@ -398,6 +400,7 @@ Connection_State :: enum {
 	New, // Got client, waiting to service first request.
 	Active, // Servicing request.
 	Idle, // Waiting for next request.
+	Hijacked, // Taken over by another protocol (see `response_hijack`).
 	Will_Close, // Closing after the current response is sent.
 	Closing, // Going to close, cleaning up.
 	Closed, // Fully closed.
@@ -431,6 +434,8 @@ Connection :: struct {
 	send_done:      proc(c: ^Connection, ok: bool),
 	// State of a pending "100 Continue" write.
 	continue_state: rawptr,
+	// Set once the connection is hijacked, see `response_hijack`.
+	hijack:         ^Hijack_State,
 }
 
 // Loop/request cycle state.
