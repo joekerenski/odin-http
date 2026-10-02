@@ -1,5 +1,6 @@
 package tests_unit
 
+import "core:path/filepath"
 import "core:testing"
 
 import http "../.."
@@ -152,4 +153,79 @@ tokens_and_values :: proc(t: ^testing.T) {
 	testing.expect(t, !http.is_request_target("/\x7f"))
 	testing.expect(t, !http.is_request_target("/\x00"))
 	testing.expect(t, !http.is_request_target("/\xc3\xa9"))
+}
+
+@(test)
+range_header :: proc(t: ^testing.T) {
+	Case :: struct { input: string, size, start, length: int, res: http.Range_Result }
+	cases := []Case{
+		{"bytes=0-9", 100, 0, 10, .Partial},
+		{"bytes=10-", 100, 10, 90, .Partial},
+		{"bytes=-10", 100, 90, 10, .Partial},
+		{"bytes=-1000", 100, 0, 100, .Partial},
+		{"bytes=90-1000", 100, 90, 10, .Partial},
+		{"Bytes=0-0", 100, 0, 1, .Partial},
+		{"bytes = 0-0", 100, 0, 0, .None},
+		{"bytes=100-", 100, 0, 0, .Unsatisfiable},
+		{"bytes=-0", 100, 0, 0, .Unsatisfiable},
+		{"bytes=0-", 0, 0, 0, .Unsatisfiable},
+		{"bytes=0-1,5-6", 100, 0, 0, .None},
+		{"bytes=5-1", 100, 0, 0, .None},
+		{"bytes=a-b", 100, 0, 0, .None},
+		{"bytes=-", 100, 0, 0, .None},
+		{"items=0-1", 100, 0, 0, .None},
+		{"bytes=0-99999999999999999999", 100, 0, 0, .None},
+		{"", 100, 0, 0, .None},
+	}
+	for c in cases {
+		start, length, res := http.parse_range(c.input, c.size)
+		testing.expectf(t, res == c.res && (res != .Partial || (start == c.start && length == c.length)),
+			"parse_range(%q, %v) = %v, %v, %v; want %v, %v, %v", c.input, c.size, start, length, res, c.start, c.length, c.res)
+	}
+}
+
+@(test)
+dir_resolve :: proc(t: ^testing.T) {
+	Case :: struct { base, target, request, want: string, ok: bool }
+	cases := []Case{
+		{"/static", "www", "/static/a.txt", "www/a.txt", true},
+		{"/static/", "www", "/static/a.txt", "www/a.txt", true},
+		{"/static", "www", "/static/sub/b.css?v=1", "www/sub/b.css", true},
+		{"/static", "www", "/static/", "www/index.html", true},
+		{"/static", "www", "/static", "www/index.html", true},
+		{"/static", "www", "/static/sub/", "www/sub/index.html", true},
+		{"/static", "www", "/static/./a.txt", "www/a.txt", true},
+		{"/static", "www", "/static//a.txt", "www/a.txt", true},
+		{"/static", "www", "/static/hello%20world.txt", "www/hello world.txt", true},
+		{"/static", "/var/www", "/static/a.txt", "/var/www/a.txt", true},
+		{"", "www", "/a.txt", "www/a.txt", true},
+		{"/static", "www", "/static../secret.txt", "", false},
+		{"/static", "www", "/staticfoo", "", false},
+		{"/static", "www", "/static/../secret.txt", "", false},
+		{"/static", "www", "/static/sub/../../secret.txt", "", false},
+		{"/static", "www", "/static/%2e%2e/secret.txt", "", false},
+		{"/static", "www", "/static/%2E%2E/secret.txt", "", false},
+		{"/static", "www", "/static/..%2fsecret.txt", "", false},
+		{"/static", "www", "/static/..%5csecret.txt", "", false},
+		{"/static", "www", "/static/a%00.txt", "", false},
+		{"/static", "www", "/static/a%0a.txt", "", false},
+		{"/static", "www", "/static/%zz", "", false},
+		{"/static", "www", "/other/a.txt", "", false},
+	}
+	for c in cases {
+		got, ok := http.dir_resolve(c.base, c.target, c.request, context.temp_allocator)
+		want, _ := filepath.clean(c.want, context.temp_allocator) // Native separators.
+		testing.expectf(t, ok == c.ok && (!ok || got == want), "dir_resolve(%q, %q, %q) = %q, %v; want %q, %v", c.base, c.target, c.request, got, ok, c.want, c.ok)
+	}
+}
+
+@(test)
+mime_types :: proc(t: ^testing.T) {
+	testing.expect(t, http.mime_from_extension("a.PNG") == .Png)
+	testing.expect(t, http.mime_from_extension("a.jpg") == .Jpeg)
+	testing.expect(t, http.mime_from_extension("a.mjs") == .Js)
+	testing.expect(t, http.mime_from_extension("a.txt") == .Plain)
+	testing.expect(t, http.mime_from_extension("a.exe") == .Octet_Stream)
+	testing.expect(t, http.mime_from_extension("noext") == .Octet_Stream)
+	testing.expect(t, http.mime_from_extension("a.verylongextension") == .Octet_Stream)
 }

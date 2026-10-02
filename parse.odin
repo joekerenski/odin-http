@@ -212,3 +212,58 @@ is_request_target :: proc "contextless" (s: string) -> bool {
 	}
 	return true
 }
+
+Range_Result :: enum {
+	// No usable Range: serve the whole representation with 200.
+	None,
+	// A single satisfiable range: serve it with 206.
+	Partial,
+	// Valid syntax, but no range overlaps the representation: 416.
+	Unsatisfiable,
+}
+
+// Parses a Range header value (RFC 9110 14.2) for a representation of `size` bytes.
+//
+// Only a single "bytes" range is supported; anything else (other units, multiple ranges, invalid
+// syntax) yields `.None` so the full representation is served, which the RFC permits.
+parse_range :: proc "contextless" (value: string, size: int) -> (start, length: int, result: Range_Result) {
+	PREFIX :: "bytes="
+	v := trim_ows(value)
+	if len(v) <= len(PREFIX) || !ascii_equal_fold(v[:len(PREFIX)], PREFIX) { return }
+	spec := trim_ows(v[len(PREFIX):])
+
+	for i in 0 ..< len(spec) {
+		if spec[i] == ',' { return } // Multiple ranges.
+	}
+
+	dash := -1
+	for i in 0 ..< len(spec) {
+		if spec[i] == '-' { dash = i; break }
+	}
+	if dash < 0 { return }
+
+	first_str, last_str := spec[:dash], spec[dash + 1:]
+	switch {
+	case first_str == "":
+		// Suffix range: the last N bytes.
+		n, ok := parse_decimal(last_str)
+		if !ok { return }
+		if n == 0 { return 0, 0, .Unsatisfiable }
+		if size == 0 { return 0, 0, .Unsatisfiable }
+		n = min(n, size)
+		return size - n, n, .Partial
+
+	case:
+		first, ok := parse_decimal(first_str)
+		if !ok { return }
+		last := size - 1
+		if last_str != "" {
+			last, ok = parse_decimal(last_str)
+			if !ok { return 0, 0, .None }
+			if last < first { return 0, 0, .None }
+			last = min(last, size - 1)
+		}
+		if first >= size { return 0, 0, .Unsatisfiable }
+		return first, last - first + 1, .Partial
+	}
+}

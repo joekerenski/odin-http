@@ -11,7 +11,7 @@ This file is the working checklist. Finding IDs (S/F/C) refer to [REPORT.md](REP
 
 - [x] **T1** `tests/server`: black-box harness that starts a real server on an ephemeral port and talks raw bytes. (528aeb5)
 - [ ] **T2** Unit tests for every parser: request line, version, header line, Content-Length, chunk size, Transfer-Encoding list, Connection list, cookies, dates, URL / percent-decoding, MIME lookup.
-- [x] **T3** Fuzz drivers for the parsers (random + mutational from a seed corpus) with invariants: no panic, bounded allocation, round-trip where applicable. Run in CI for a fixed time budget. (this commit)
+- [x] **T3** Fuzz drivers for the parsers (random + mutational from a seed corpus) with invariants: no panic, bounded allocation, round-trip where applicable. Run in CI for a fixed time budget. (6c7ab4a)
 - [x] **T4** Pipelining / keep-alive tests: N requests on one connection with mixed bodies, verify exact response framing. (984d62c)
 - [ ] **T5** Concurrency tests: many connections across threads, shutdown under load, no leaks (tracking allocator) and clean ASan.
 - [ ] **T6** Client test harness: crafted-response server (status, framing, TLS with a local CA, truncation, slow responses).

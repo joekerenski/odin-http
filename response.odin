@@ -3,6 +3,8 @@ package http
 import "core:bytes"
 import "core:io"
 import "core:log"
+import "core:mem"
+import "core:nbio"
 import "core:mem/virtual"
 import "core:slice"
 import "core:strconv"
@@ -28,7 +30,21 @@ Response :: struct {
 	_heading_len:     int,
 	// Whether the written heading contains `connection: close`.
 	_close_written:   bool,
+	// A file to send after the heading, see `respond_file`. The handle is owned by the response.
+	_file:            Maybe(Response_File),
 }
+
+@(private)
+Response_File :: struct {
+	handle: nbio.Handle,
+	offset: int,
+	length: int,
+}
+
+// Files are sent in chunks of this size, so `write_timeout` applies per chunk (progress) rather
+// than to the whole file.
+@(private)
+SENDFILE_CHUNK :: 4 * mem.Megabyte
 
 response_init :: proc(r: ^Response, allocator := context.allocator) {
 	r.status             = .Not_Found
@@ -347,7 +363,13 @@ response_send_got_body :: proc(r: ^Response, will_close: bool) {
 	conn := r._conn
 
 	if will_close {
-		if !connection_set_state(r._conn, .Will_Close) { return }
+		if !connection_set_state(r._conn, .Will_Close) {
+			if file, has_file := r._file.?; has_file {
+				nbio.close(file.handle)
+				r._file = nil
+			}
+			return
+		}
 		_response_ensure_close_header(r)
 	}
 
@@ -363,7 +385,60 @@ response_send_got_body :: proc(r: ^Response, will_close: bool) {
 		buf = buf[:r._heading_len]
 	}
 
+	if file, has_file := r._file.?; has_file {
+		if conn.loop.req.is_head {
+			nbio.close(file.handle)
+			r._file = nil
+		} else {
+			connection_send(conn, buf, on_heading_sent)
+			return
+		}
+	}
+
 	connection_send(conn, buf, on_response_sent)
+
+	on_heading_sent :: proc(conn: ^Connection, ok: bool) {
+		if !ok {
+			response_file_done(conn, false)
+			return
+		}
+		response_file_send_next(conn)
+	}
+}
+
+@(private)
+response_file_send_next :: proc(conn: ^Connection) {
+	file := &conn.loop.res._file.?
+	n := min(file.length, SENDFILE_CHUNK)
+	timeout := conn.server.opts.write_timeout if conn.server.opts.write_timeout > 0 else nbio.NO_TIMEOUT
+	nbio.sendfile_poly(conn.socket, file.handle, conn, on_sent, offset = file.offset, nbytes = n, timeout = timeout)
+
+	on_sent :: proc(op: ^nbio.Operation, conn: ^Connection) {
+		if op.sendfile.err != nil {
+			log.infof("sendfile on connection %i failed: %v", conn.socket, op.sendfile.err)
+			response_file_done(conn, false)
+			return
+		}
+
+		file := &conn.loop.res._file.?
+		file.offset += op.sendfile.sent
+		file.length -= op.sendfile.sent
+		if file.length > 0 {
+			response_file_send_next(conn)
+			return
+		}
+		response_file_done(conn, true)
+	}
+}
+
+@(private)
+response_file_done :: proc(conn: ^Connection, ok: bool) {
+	if file, has_file := conn.loop.res._file.?; has_file {
+		nbio.close(file.handle)
+		conn.loop.res._file = nil
+	}
+	// The heading promised a body we didn't fully send: the connection can't be reused.
+	on_response_sent(conn, ok)
 }
 
 // Makes sure the response tells the client the connection is closed (RFC 9112 9.6), also when

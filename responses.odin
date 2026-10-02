@@ -1,10 +1,11 @@
 package http
 
-import "core:bytes"
 import "core:encoding/json"
+import "core:fmt"
 import "core:io"
 import "core:log"
 import "core:nbio"
+import "core:net"
 import "core:path/filepath"
 import "core:strings"
 
@@ -27,67 +28,83 @@ respond_plain :: proc(r: ^Response, text: string, status: Status = .OK, loc := #
 /*
 Sends the content of the file at the given path as the response.
 
-This procedure uses non blocking IO and only allocates the size of the file in the body's buffer,
-no other allocations or temporary buffers, this is to make it as fast as possible.
+The file is streamed with the platform's zero-copy `sendfile` where available (emulated otherwise),
+nothing is buffered in memory. Single byte ranges (`Range: bytes=a-b`) are supported (206/416).
 
 The content type is taken from the path, optionally overwritten using the parameter.
 
-If the file doesn't exist, a 404 response is sent.
-If any other error occurs, a 500 is sent and the error is logged.
+If the file doesn't exist, or isn't a regular file (directory, pipe, device...), a 404 is sent.
 */
 respond_file :: proc(r: ^Response, path: string, content_type: Maybe(Mime_Type) = nil, loc := #caller_location) {
-	// PERF: we are still putting the content into the body buffer, we could stream it.
-
 	assert_has_td(loc)
 	assert(!r.sent, "response has already been sent", loc)
 
+	// A NUL would truncate the path when it's handed to the OS, while the content type is derived
+	// from the full string.
+	if strings.index_byte(path, 0) >= 0 {
+		respond_with_status(r, .Not_Found)
+		return
+	}
+
 	mime := content_type.? or_else mime_from_extension(path)
-	content_type := mime_to_content_type(mime)
-	headers_set_content_type(&r.headers, content_type)
+	headers_set_content_type(&r.headers, mime_to_content_type(mime))
 
 	nbio.open_poly(path, r, on_open)
 
 	on_open :: proc(op: ^nbio.Operation, r: ^Response) {
 		#partial switch op.open.err {
+		case nil:
+			nbio.stat_poly2(op.open.handle, op.open.path, r, on_stat)
 		case .Not_Found:
 			log.debugf("respond_file, open %q, no such file or directory", op.open.path)
 			respond_with_status(r, .Not_Found)
 		case:
-			log.warnf("respond_file, open %q error: %i", op.open.path, op.open.err)
+			log.infof("respond_file, open %q error: %v", op.open.path, op.open.err)
 			respond_with_status(r, .Not_Found)
-		case nil:
-			nbio.stat_poly2(op.open.handle, op.open.path, r, on_stat)
 		}
 	}
 
 	on_stat :: proc(op: ^nbio.Operation, path: string, r: ^Response) {
-		#partial switch op.stat.err {
-		case:
-			log.errorf("respond_file, could not stat %q: %v", path, op.stat.err)
+		if op.stat.err != nil || op.stat.type != .Regular {
+			if op.stat.err != nil {
+				log.warnf("respond_file, could not stat %q: %v", path, op.stat.err)
+			}
 			nbio.close(op.stat.handle)
 			respond_with_status(r, .Not_Found)
-		case nil:
-			assert(op.stat.size < i64(max(int)))
-
-			_response_write_heading(r, int(op.stat.size))
-
-			bytes.buffer_grow(&r._buf, int(op.stat.size))
-			buf := _dynamic_unwritten(r._buf.buf)[:op.stat.size]
-
-			nbio.read_poly2(op.stat.handle, 0, buf, path, r, on_read, all=true)
+			return
 		}
-	}
 
-	on_read :: proc(op: ^nbio.Operation, path: string, r: ^Response) {
-		nbio.close(op.read.handle)
-		#partial switch op.read.err {
-		case:
-			log.errorf("respond_file, could not read %q: %v", path, op.read.err)
-			respond_with_status(r, .Internal_Server_Error)
-		case nil:
-			_dynamic_add_len(&r._buf.buf, op.read.read)
-			respond_with_status(r, .OK)
+		size := int(op.stat.size)
+		start, length := 0, size
+		r.status = .OK
+
+		headers_set_unsafe(&r.headers, "accept-ranges", "bytes")
+		headers_set_unsafe(&r.headers, "x-content-type-options", "nosniff")
+
+		req := &r._conn.loop.req
+		if range_value, has_range := headers_get_unsafe(req.headers, "range"); has_range && !headers_has_unsafe(req.headers, "if-range") {
+			switch rstart, rlength, res := parse_range(range_value, size); res {
+			case .None:
+			case .Partial:
+				start, length = rstart, rlength
+				r.status = .Partial_Content
+				headers_set_unsafe(&r.headers, "content-range", fmt.tprintf("bytes %i-%i/%i", start, start + length - 1, size))
+			case .Unsatisfiable:
+				nbio.close(op.stat.handle)
+				headers_set_unsafe(&r.headers, "content-range", fmt.tprintf("bytes */%i", size))
+				respond_with_status(r, .Range_Not_Satisfiable)
+				return
+			}
 		}
+
+		_response_write_heading(r, length)
+
+		if length > 0 && !req.is_head {
+			r._file = Response_File{handle = op.stat.handle, offset = start, length = length}
+		} else {
+			nbio.close(op.stat.handle)
+		}
+		respond(r)
 	}
 }
 
@@ -109,28 +126,66 @@ respond_file_content :: proc(r: ^Response, path: string, content: []byte, status
 /*
 Sets the response to one that, based on the request path, returns a file.
 base:    The base of the request path that should be removed when retrieving the file.
-target:  The path to the directory to serve.
-request: The request path.
+target:  The path to the directory to serve (relative to the working directory, or absolute).
+request: The request path (as received, percent-encoded).
 
-Path traversal is detected and cleaned up.
-The Content-Type is set based on the file extension, see the MimeType enum for known file extensions.
+The part of the request path after `base` is percent-decoded and split into segments; a request is
+refused (404) if `base` doesn't match whole path segments, or if any decoded segment is "..",
+contains a NUL/control character, or a backslash. So the served file is always inside `target`.
+Symbolic links inside `target` are followed.
+
+A request for a directory serves its "index.html".
+
+The Content-Type is set based on the file extension, see the Mime_Type enum for known file extensions.
 */
 respond_dir :: proc(r: ^Response, base, target, request: string, loc := #caller_location) {
-	if !strings.has_prefix(request, base) {
+	file_path, ok := dir_resolve(base, target, request, context.temp_allocator)
+	if !ok {
 		respond(r, Status.Not_Found)
 		return
 	}
-
-	// Detect path traversal attacks.
-	req_clean, err_req   := filepath.clean(request, context.temp_allocator)
-	base_clean, err_base := filepath.clean(base, context.temp_allocator)
-	if err_req != nil || err_base != nil || !strings.has_prefix(req_clean, base_clean) {
-		respond(r, Status.Not_Found)
-		return
-	}
-
-	file_path, _ := filepath.join([]string{"./", target, strings.trim_prefix(req_clean, base_clean)}, context.temp_allocator)
 	respond_file(r, file_path, loc = loc)
+}
+
+// Maps a request path onto a file inside `target`, see `respond_dir`. Exposed for testing.
+dir_resolve :: proc(base, target, request: string, allocator := context.temp_allocator) -> (file_path: string, ok: bool) {
+	// The query and fragment are not part of the path.
+	request := request
+	if i := strings.index_any(request, "?#"); i >= 0 {
+		request = request[:i]
+	}
+
+	base_path := strings.trim_right(base, "/")
+	if !strings.has_prefix(request, base_path) { return }
+	rest := request[len(base_path):]
+	// "/static" must not match "/static../x" or "/staticfoo".
+	if len(rest) > 0 && rest[0] != '/' { return }
+
+	segments := make([dynamic]string, 0, 8, allocator)
+	append(&segments, target)
+
+	trailing_slash := len(rest) == 0 || rest[len(rest) - 1] == '/'
+	for raw_seg in strings.split_iterator(&rest, "/") {
+		if raw_seg == "" { continue }
+
+		seg := net.percent_decode(raw_seg, allocator) or_return
+		if seg == "." { continue }
+		if seg == ".." { return }
+		for i in 0 ..< len(seg) {
+			c := seg[i]
+			// Decoded slashes would re-introduce segments; backslashes are separators on Windows.
+			if c < 0x20 || c == 0x7f || c == '/' || c == '\\' { return }
+		}
+		append(&segments, seg)
+	}
+
+	if trailing_slash || len(segments) == 1 {
+		append(&segments, "index.html")
+	}
+
+	joined, err := filepath.join(segments[:], allocator)
+	if err != nil { return }
+	return joined, true
 }
 
 // Sets the response to one that returns the JSON representation of the given value.
