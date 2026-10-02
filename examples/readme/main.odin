@@ -25,8 +25,8 @@ main :: proc() {
 	// They are very similar to regex patterns but a bit more limited, which makes them much easier to implement since Odin does not have a regex implementation.
 
 	// Matches /users followed by any word (alphanumeric) followed by /comments and then / with any number.
-	// The word is available as req.url_params[0], and the number as req.url_params[1].
-	http.route_get(&router, "/users/(%w+)/comments/(%d+)", http.handler(proc(req: ^http.Request, res: ^http.Response) {
+	// The captures are available as req.url_params[0] and req.url_params[1], or by name with http.url_param(req, "user").
+	http.route_get(&router, "/users/:user/comments/:comment", http.handler(proc(req: ^http.Request, res: ^http.Response) {
 		http.respond_plain(res, fmt.tprintf("user %s, comment: %s", req.url_params[0], req.url_params[1]))
 	}))
 	http.route_get(&router, "/cookies", http.handler(cookies))
@@ -35,7 +35,7 @@ main :: proc() {
 	http.route_get(&router, "/index", http.handler(index))
 
 	// Matches every get request that did not match another route.
-	http.route_get(&router, "(.*)", http.handler(static))
+	http.route_get(&router, "/*path", http.handler(static))
 
 	http.route_post(&router, "/ping", http.handler(post_ping))
 
@@ -77,7 +77,7 @@ index :: proc(req: ^http.Request, res: ^http.Response) {
 }
 
 static :: proc(req: ^http.Request, res: ^http.Response) {
-	http.respond_dir(res, "/", "examples/complete/static", req.url_params[0])
+	http.respond_dir(res, "/", "examples/complete/static", req.url.path)
 }
 
 post_ping :: proc(req: ^http.Request, res: ^http.Response) {

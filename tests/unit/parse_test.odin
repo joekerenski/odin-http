@@ -229,3 +229,15 @@ mime_types :: proc(t: ^testing.T) {
 	testing.expect(t, http.mime_from_extension("noext") == .Octet_Stream)
 	testing.expect(t, http.mime_from_extension("a.verylongextension") == .Octet_Stream)
 }
+
+@(test)
+url_parsing :: proc(t: ^testing.T) {
+	u := http.url_parse("/a://b?c=d#frag")
+	testing.expectf(t, u.path == "/a://b" && u.query == "c=d" && u.scheme == "" && u.host == "", "%v", u)
+	u = http.url_parse("https://example.com:8443/p/q?x=1#y")
+	testing.expectf(t, u.scheme == "https" && u.host == "example.com:8443" && u.path == "/p/q" && u.query == "x=1", "%v", u)
+	u = http.url_parse("http://example.com")
+	testing.expectf(t, u.host == "example.com" && u.path == "", "%v", u)
+	u = http.url_parse("/")
+	testing.expect(t, u.path == "/")
+}

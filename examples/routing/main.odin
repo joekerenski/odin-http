@@ -39,7 +39,7 @@ main :: proc() {
 	// https://www.lua.org/pil/20.2.html
 	// They are very similar to regex patterns but a bit more limited, which makes them much easier to implement since Odin does not have a regex implementation.
 
-	http.route_get(&router, "/hello/(%w+)", http.handler(proc(req: ^http.Request, res: ^http.Response) {
+	http.route_get(&router, "/hello/:name", http.handler(proc(req: ^http.Request, res: ^http.Response) {
 		http.respond_plain(res, strings.concatenate({ "Hello, ", req.url_params[0] }))
 		http.respond(res)
 	}))
@@ -70,7 +70,7 @@ main :: proc() {
 	}))
 
 	// Custom 404 page.
-	http.route_all(&router, "(.*)", http.handler(proc(req: ^http.Request, res: ^http.Response) {
+	http.route_all(&router, "/*path", http.handler(proc(req: ^http.Request, res: ^http.Response) {
 			http.respond_plain(res, fmt.tprintf("Welcome, could not find the path %q", req.url_params[0]), .Not_Found)
 		}))
 

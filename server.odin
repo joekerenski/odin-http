@@ -707,7 +707,31 @@ conn_handle_req :: proc(c: ^Connection, allocator := context.temp_allocator) {
 			(&l.req.line.(Requestline)).version.minor = 1
 		}
 
-		l.req.url = url_parse(rline.target.(string))
+		// RFC 9112 3.2: origin-form ("/path?query") is what clients send to servers; absolute-form
+		// ("http://host/path") must be accepted too; asterisk-form only for OPTIONS; authority-form
+		// only for CONNECT. Anything else, or a fragment, is a bad request.
+		target := rline.target.(string)
+		target_ok: bool
+		switch {
+		case strings.index_byte(target, '#') >= 0: target_ok = false
+		case target[0] == '/':                     target_ok = true
+		case target == "*":                        target_ok = rline.method == .Options
+		case rline.method == .Connect:             target_ok = true
+		case:
+			scheme_end := strings.index(target, "://")
+			target_ok = scheme_end > 0 && (ascii_equal_fold(target[:scheme_end], "http") || ascii_equal_fold(target[:scheme_end], "https"))
+		}
+		if !target_ok {
+			log.infof("request-target %q invalid for %v", target, rline.method)
+			reject(l, .Bad_Request)
+			return
+		}
+
+		l.req.url = url_parse(target)
+		if len(l.req.url.path) == 0 && target != "*" && rline.method != .Connect {
+			// "http://host" without a path means "/".
+			l.req.url.path = "/"
+		}
 
 		l.header_bytes_left = l.conn.server.opts.limit_headers
 		l.header_count      = 0

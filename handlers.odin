@@ -1,7 +1,10 @@
 package http
 
+import "base:runtime"
+
 import "core:net"
 import "core:strconv"
+import "core:strings"
 import "core:sync"
 import "core:time"
 
@@ -51,17 +54,30 @@ rate_limit_message :: proc(message: ^string) -> Rate_Limit_On_Limit {
 }
 
 Rate_Limit_Opts :: struct {
-	window:   time.Duration,
-	max:      int,
+	window:      time.Duration,
+	// Requests allowed per client per window.
+	max:         int,
 
 	// Optional handler to call when a request is being rate-limited, allows you to customize the response.
-	on_limit: Maybe(Rate_Limit_On_Limit),
+	on_limit:    Maybe(Rate_Limit_On_Limit),
+
+	// The most clients tracked per window, defaults to 100_000. Once full, requests from clients that
+	// aren't tracked yet are limited (fail closed) until the window ends, so the table can't be used
+	// to exhaust memory.
+	max_clients: int,
+
+	// How many reverse proxies, that each append to X-Forwarded-For, are in front of the server.
+	// 0 (default) uses the TCP peer address. With 1 (e.g. Caddy), the right-most X-Forwarded-For entry
+	// is used, which the proxy set to the address it saw. Only set this when clients can't reach the
+	// server directly, otherwise they can pick their own key.
+	trusted_proxies: int,
 }
 
 Rate_Limit_Data :: struct {
 	opts:       ^Rate_Limit_Opts,
 	next_sweep: time.Time,
 	hits:       map[net.Address]int,
+	allocator:  runtime.Allocator,
 	mu:         sync.Mutex,
 }
 
@@ -70,40 +86,82 @@ rate_limit_destroy :: proc(data: ^Rate_Limit_Data) {
 	delete(data.hits)
 }
 
-// Basic rate limit based on IP address.
+// The address a request is attributed to: the TCP peer, or with `trusted_proxies > 0` the matching
+// X-Forwarded-For entry (falling back to the peer when the header is missing or malformed).
+// IPv6 addresses are reduced to their /64 prefix, a single client typically controls a whole /64.
+request_client_key :: proc(req: ^Request, trusted_proxies: int) -> net.Address {
+	addr := req.client.address
+
+	if trusted_proxies > 0 {
+		if xff, has := headers_get_unsafe(req.headers, "x-forwarded-for"); has {
+			// The proxies each appended one entry, the one we want is `trusted_proxies` from the right.
+			entries := strings.split(xff, ",", context.temp_allocator)
+			if idx := len(entries) - trusted_proxies; idx >= 0 {
+				if parsed := net.parse_address(trim_ows(entries[idx])); parsed != nil {
+					addr = parsed
+				}
+			}
+		}
+	}
+
+	if ip6, is_ip6 := addr.(net.IP6_Address); is_ip6 {
+		for i in 4 ..< 8 { ip6[i] = 0 }
+		addr = ip6
+	}
+	return addr
+}
+
+// Basic fixed-window rate limit per client address.
 rate_limit :: proc(data: ^Rate_Limit_Data, next: ^Handler, opts: ^Rate_Limit_Opts, allocator := context.allocator) -> Handler {
 	assert(next != nil)
 
 	h: Handler
 	h.next = next
 
+	if opts.max_clients <= 0 { opts.max_clients = 100_000 }
+
 	data.opts = opts
+	data.allocator = allocator
 	data.hits = make(map[net.Address]int, 16, allocator)
 	data.next_sweep = time.time_add(time.now(), opts.window)
 	h.user_data = data
 
 	h.handle = proc(h: ^Handler, req: ^Request, res: ^Response) {
 		data := (^Rate_Limit_Data)(h.user_data)
+		key := request_client_key(req, data.opts.trusted_proxies)
 
-		sync.lock(&data.mu)
+		limited: bool
+		retry_after: time.Duration
+		{
+			sync.guard(&data.mu)
 
-		// PERF: if this is not performing, we could run a thread that sweeps on a regular basis.
-		if time.since(data.next_sweep) > 0 {
-			clear(&data.hits)
-			data.next_sweep = time.time_add(time.now(), data.opts.window)
+			now := time.now()
+			if time.diff(data.next_sweep, now) >= 0 {
+				// Re-make instead of clear, so a burst of clients doesn't pin the map's capacity.
+				delete(data.hits)
+				data.hits = make(map[net.Address]int, 16, data.allocator)
+				data.next_sweep = time.time_add(now, data.opts.window)
+			}
+
+			if hits, tracked := &data.hits[key]; tracked {
+				hits^ += 1
+				limited = hits^ > data.opts.max
+			} else if len(data.hits) >= data.opts.max_clients {
+				limited = true
+			} else {
+				data.hits[key] = 1
+				limited = 1 > data.opts.max
+			}
+			retry_after = time.diff(now, data.next_sweep)
 		}
 
-		hits := data.hits[req.client.address]
-		data.hits[req.client.address] = hits + 1
-		sync.unlock(&data.mu)
-
-		if hits > data.opts.max {
+		if limited {
 			res.status = .Too_Many_Requests
 
-			retry_dur := i64(time.diff(time.now(), data.next_sweep) / time.Second)
+			// Round up, and never tell a client to retry "now".
+			secs := max(1, i64((retry_after + time.Second - 1) / time.Second))
 			buf := make([]byte, 32, context.temp_allocator)
-			retry_str := strconv.write_int(buf, retry_dur, 10)
-			headers_set_unsafe(&res.headers, "retry-after", retry_str)
+			headers_set_unsafe(&res.headers, "retry-after", strconv.write_int(buf, secs, 10))
 
 			if on, ok := data.opts.on_limit.(Rate_Limit_On_Limit); ok {
 				on.on_limit(req, res, on.user_data)

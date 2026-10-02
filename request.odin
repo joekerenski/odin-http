@@ -18,8 +18,9 @@ Request :: struct {
 	url:        URL,
 	client:     net.Endpoint,
 
-	// Route params/captures.
+	// Route params/captures, in order, as received (not percent-decoded). See `url_param`.
 	url_params: []string,
+	_route:     ^Route,
 
 	// Internal usage only.
 	_scanner:         ^Scanner,

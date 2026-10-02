@@ -175,3 +175,14 @@ response_header_injection_dropped :: proc(t: ^testing.T) {
 	testing.expectf(t, status_of(resp) == 200 && strings.contains(resp, "x-ok: fine\r\n"), "got %q", resp)
 	testing.expectf(t, !strings.contains(resp, "Injected") && !strings.contains(resp, "x-cr") && !strings.contains(resp, "bad name"), "got %q", resp)
 }
+
+@(test)
+request_target_forms :: proc(t: ^testing.T) {
+	expect_status(t, "GET foo/admin HTTP/1.1\r\nHost: x\r\n\r\n", 400)
+	expect_status(t, "GET * HTTP/1.1\r\nHost: x\r\n\r\n", 400)
+	expect_status(t, "GET /a#frag HTTP/1.1\r\nHost: x\r\n\r\n", 400)
+	expect_status(t, "GET ftp://x/a HTTP/1.1\r\nHost: x\r\n\r\n", 400)
+	resp := expect_status(t, "GET http://x/echo HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\n\r\n", 200)
+	testing.expectf(t, strings.contains(resp, "got 0 bytes"), "absolute-form not routed by path: %q", resp)
+	expect_status(t, "GET HTTP://x HTTP/1.1\r\nHost: x\r\n\r\n", 200)
+}

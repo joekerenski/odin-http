@@ -302,6 +302,10 @@ _response_write_heading :: proc(r: ^Response, content_length: int) {
 	}
 
 	for cookie in r.cookies {
+		if !cookie_valid(cookie) {
+			log.warnf("dropping invalid cookie %q", cookie.name)
+			continue
+		}
 		cookie_write(bstream, cookie)
 		ws(b, "\r\n")
 	}

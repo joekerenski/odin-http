@@ -26,17 +26,51 @@ Cookie :: struct {
 	same_site:    Cookie_Same_Site,
 }
 
+// Reports whether the cookie can be written without injecting attributes or headers:
+// the name is a token, the value consists of cookie-octets (optionally in double quotes, RFC 6265 4.1.1),
+// and domain/path contain no ';' or control characters.
+cookie_valid :: proc(c: Cookie) -> bool {
+	is_cookie_octet :: proc(b: byte) -> bool {
+		// %x21 / %x23-2B / %x2D-3A / %x3C-5B / %x5D-7E: US-ASCII without CTLs, whitespace, DQUOTE, comma, semicolon and backslash.
+		return b == 0x21 || (b >= 0x23 && b <= 0x2B) || (b >= 0x2D && b <= 0x3A) || (b >= 0x3C && b <= 0x5B) || (b >= 0x5D && b <= 0x7E)
+	}
+	is_attr_value :: proc(s: string) -> bool {
+		for i in 0 ..< len(s) {
+			if s[i] < 0x20 || s[i] == 0x7f || s[i] == ';' { return false }
+		}
+		return true
+	}
+
+	if !is_token(c.name) { return false }
+
+	v := c.value
+	if len(v) >= 2 && v[0] == '"' && v[len(v) - 1] == '"' {
+		v = v[1:len(v) - 1]
+	}
+	for i in 0 ..< len(v) {
+		if !is_cookie_octet(v[i]) { return false }
+	}
+
+	if d, ok := c.domain.(string); ok && !is_attr_value(d) { return false }
+	if p, ok := c.path.(string); ok && !is_attr_value(p) { return false }
+	return true
+}
+
 // Builds the Set-Cookie header string representation of the given cookie.
+//
+// Returns `.Invalid_Write` without writing anything if the cookie is not `cookie_valid`.
 cookie_write :: proc(w: io.Writer, c: Cookie) -> io.Error {
+	if !cookie_valid(c) { return .Invalid_Write }
+
 	// odinfmt:disable
 	io.write_string(w, "set-cookie: ") or_return
-	write_escaped_newlines(w, c.name)  or_return
+	io.write_string(w, c.name)         or_return
 	io.write_byte(w, '=')              or_return
-	write_escaped_newlines(w, c.value) or_return
+	io.write_string(w, c.value)        or_return
 
 	if d, ok := c.domain.(string); ok {
 		io.write_string(w, "; Domain=") or_return
-		write_escaped_newlines(w, d)    or_return
+		io.write_string(w, d)           or_return
 	}
 
 	if e, ok := c.expires_gmt.(time.Time); ok {
@@ -51,7 +85,7 @@ cookie_write :: proc(w: io.Writer, c: Cookie) -> io.Error {
 
 	if p, ok := c.path.(string); ok {
 		io.write_string(w, "; Path=") or_return
-		write_escaped_newlines(w, p)  or_return
+		io.write_string(w, p)         or_return
 	}
 
 	switch c.same_site {
@@ -87,98 +121,48 @@ cookie_string :: proc(c: Cookie, allocator := context.allocator) -> string {
 	return strings.to_string(b)
 }
 
-// TODO: check specific whitespace requirements in RFC.
+// Parses a Set-Cookie header value following RFC 6265 5.2: the name must be non-empty, the value may
+// be empty, unknown attributes and attributes with invalid values are ignored.
 //
-// Allocations are done to check case-insensitive attributes but they are deleted right after.
-// So, all the returned strings (inside cookie) are slices into the given value string.
+// All the returned strings (inside cookie) are slices into the given value string, nothing is allocated.
 cookie_parse :: proc(value: string, allocator := context.allocator) -> (cookie: Cookie, ok: bool) {
-	value := value
-
-	eq := strings.index_byte(value, '=')
-	if eq < 1 { return }
-
 	cookie._raw = value
-	cookie.name = value[:eq]
-	value = value[eq + 1:]
 
-	semi := strings.index_byte(value, ';')
-	switch semi {
-	case -1:
-		cookie.value = value
-		ok = true
-		return
-	case 0:
-		return
-	case:
-		cookie.value = value[:semi]
-		value = value[semi + 1:]
-	}
+	pair, _, attrs := strings.partition(value, ";")
+	eq := strings.index_byte(pair, '=')
+	if eq < 0 { return }
 
-	parse_part :: proc(cookie: ^Cookie, part: string, allocator := context.temp_allocator) -> (ok: bool) {
-		eq := strings.index_byte(part, '=')
-		switch eq {
-		case -1:
-			key := strings.to_lower(part, allocator)
-			defer delete(key, allocator)
+	cookie.name  = trim_ows(pair[:eq])
+	cookie.value = trim_ows(pair[eq + 1:])
+	if len(cookie.name) == 0 { return }
 
-			switch key {
-			case "httponly":
-				cookie.http_only = true
-			case "partitioned":
-				cookie.partitioned = true
-			case "secure":
-				cookie.secure = true
-			case:
-				return
-			}
-		case 0:
-			return
-		case:
-			key := strings.to_lower(part[:eq], allocator)
-			defer delete(key, allocator)
+	rest := attrs
+	for part in strings.split_iterator(&rest, ";") {
+		key, _, val := strings.partition(part, "=")
+		key = trim_ows(key)
+		val = trim_ows(val)
 
-			value := part[eq + 1:]
-
-			switch key {
-			case "domain":
-				cookie.domain = value
-			case "expires":
-				cookie.expires_gmt = cookie_date_parse(value) or_return
-			case "max-age":
-				cookie.max_age_secs = strconv.parse_int(value, 10) or_return
-			case "path":
-				cookie.path = value
-			case "samesite":
-				switch value {
-				case "lax", "Lax", "LAX":
-					cookie.same_site = .Lax
-				case "none", "None", "NONE":
-					cookie.same_site = .None
-				case "strict", "Strict", "STRICT":
-					cookie.same_site = .Strict
-				case:
-					return
-				}
-			case:
-				return
+		switch {
+		case ascii_equal_fold(key, "httponly"):    cookie.http_only = true
+		case ascii_equal_fold(key, "partitioned"): cookie.partitioned = true
+		case ascii_equal_fold(key, "secure"):      cookie.secure = true
+		case ascii_equal_fold(key, "domain"):      cookie.domain = val
+		case ascii_equal_fold(key, "path"):        cookie.path = val
+		case ascii_equal_fold(key, "expires"):
+			if t, tok := cookie_date_parse(val); tok { cookie.expires_gmt = t }
+		case ascii_equal_fold(key, "max-age"):
+			// RFC 6265 5.2.2: 1*DIGIT, optionally preceded by '-'.
+			neg := len(val) > 0 && val[0] == '-'
+			if n, nok := parse_decimal(val[1:] if neg else val); nok { cookie.max_age_secs = -n if neg else n }
+		case ascii_equal_fold(key, "samesite"):
+			switch {
+			case ascii_equal_fold(val, "lax"):    cookie.same_site = .Lax
+			case ascii_equal_fold(val, "none"):   cookie.same_site = .None
+			case ascii_equal_fold(val, "strict"): cookie.same_site = .Strict
 			}
 		}
-		return true
 	}
 
-	for semi = strings.index_byte(value, ';'); semi != -1; semi = strings.index_byte(value, ';') {
-		part := strings.trim_left_space(value[:semi])
-		value = value[semi + 1:]
-		parse_part(&cookie, part, allocator) or_return
-	}
-
-	part := strings.trim_left_space(value)
-	if part == "" {
-		ok = true
-		return
-	}
-
-	parse_part(&cookie, part, allocator) or_return
 	ok = true
 	return
 }
@@ -368,7 +352,9 @@ cookie_date_parse :: proc(value: string) -> (t: time.Time, ok: bool) {
 /*
 Retrieves the cookie with the given `key` out of the requests `Cookie` header.
 
-If the same key is in the header multiple times the last one is returned.
+If the same key is in the header multiple times the first one is returned: browsers send cookies with
+more specific paths first, and a sibling (sub)domain can add a cookie with the same name but can't
+make it come first.
 */
 request_cookie_get :: proc(r: ^Request, key: string) -> (value: string, ok: bool) {
 	cookies := headers_get_unsafe(r.headers, "cookie") or_return
@@ -383,16 +369,14 @@ request_cookie_get :: proc(r: ^Request, key: string) -> (value: string, ok: bool
 /*
 Allocates a map with the given allocator and puts all cookie pairs from the requests `Cookie` header into it.
 
-If the same key is in the header multiple times the last one is returned.
+If the same key is in the header multiple times the first one is kept, see `request_cookie_get`.
 */
 request_cookies :: proc(r: ^Request, allocator := context.temp_allocator) -> (res: map[string]string) {
 	res.allocator = allocator
 
 	cookies := headers_get_unsafe(r.headers, "cookie") or_else ""
 	for k, v in request_cookies_iter(&cookies) {
-		// Don't overwrite, the iterator goes from right to left and we want the last.
 		if k in res { continue }
-
 		res[k] = v
 	}
 
@@ -400,35 +384,28 @@ request_cookies :: proc(r: ^Request, allocator := context.temp_allocator) -> (re
 }
 
 /*
-Iterates the cookies from right to left.
+Iterates the `name=value` pairs of a Cookie header from left to right. Pairs are separated by ';'
+(with optional whitespace); pairs without '=' or with an empty name are skipped. A value in double
+quotes is returned without them.
 */
 request_cookies_iter :: proc(cookies: ^string) -> (key: string, value: string, ok: bool) {
-	end := len(cookies)
-	eq  := -1
-	for i := end-1; i >= 0; i-=1 {
-		b := cookies[i]
-		start := i == 0
-		sep := start || b == ' ' && cookies[i-1] == ';'
-		if sep {
-			defer end = i - 1
-
-			// Invalid.
-			if eq < 0 {
-				continue
-			}
-
-			off := 0 if start else 1
-
-			key   = cookies[i+off:eq]
-			value = cookies[eq+1:end]
-
-			cookies^ = cookies[:i-off]
-
-			return key, value, true
-		} else if b == '=' {
-			eq = i
+	for len(cookies) > 0 {
+		pair: string
+		if semi := strings.index_byte(cookies^, ';'); semi >= 0 {
+			pair, cookies^ = cookies[:semi], cookies[semi + 1:]
+		} else {
+			pair, cookies^ = cookies^, ""
 		}
-	}
 
+		eq := strings.index_byte(pair, '=')
+		if eq < 0 { continue }
+		key   = trim_ows(pair[:eq])
+		value = trim_ows(pair[eq + 1:])
+		if len(key) == 0 { continue }
+		if len(value) >= 2 && value[0] == '"' && value[len(value) - 1] == '"' {
+			value = value[1:len(value) - 1]
+		}
+		return key, value, true
+	}
 	return
 }
