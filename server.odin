@@ -491,6 +491,11 @@ conn_handle_req :: proc(c: ^Connection, allocator := context.temp_allocator) {
 		if err != nil {
 			if err == .EOF {
 				log.debugf("client disconnected (EOF)")
+			} else if err == .Too_Long {
+				log.info("request-line too long")
+				l.req.line = Requestline{version = {1, 1}}
+				reject(l, .URI_Too_Long)
+				return
 			} else {
 				log.warnf("request scanner error: %v", err)
 			}

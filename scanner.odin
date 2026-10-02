@@ -130,6 +130,13 @@ scanner_scan :: proc(
 		}
 		s.start += advance
 
+		// max_token_size is a hard limit on the token, not just on how far the buffer grows.
+		if len(token) > s.max_token_size && s.max_token_size > 0 {
+			set_err(s, .Too_Long)
+			callback(user_data, "", s._err)
+			return
+		}
+
 		s.token = token
 		if s.token != nil {
 			if s._err == nil || advance > 0 {
@@ -156,6 +163,13 @@ scanner_scan :: proc(
 	if s._err != nil {
 		s.start = 0
 		s.end = 0
+		callback(user_data, "", s._err)
+		return
+	}
+
+	// No token in what we have, and what we have is already at the limit: reading more can't help.
+	if s.max_token_size > 0 && s.end - s.start >= s.max_token_size {
+		set_err(s, .Too_Long)
 		callback(user_data, "", s._err)
 		return
 	}

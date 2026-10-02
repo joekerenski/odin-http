@@ -27,6 +27,8 @@ Response :: struct {
 	_heading_written: bool,
 	// Length of the status line + headers in `_buf`, used to send only the heading for HEAD requests.
 	_heading_len:     int,
+	// Whether the written heading contains `connection: close`.
+	_close_written:   bool,
 }
 
 response_init :: proc(r: ^Response, allocator := context.allocator) {
@@ -267,6 +269,10 @@ _response_write_heading :: proc(r: ^Response, content_length: int) {
 
 	bstream := bytes.buffer_to_stream(b)
 
+	if v, has := headers_get_unsafe(r.headers, "connection"); has && header_list_has_token(v, "close") {
+		r._close_written = true
+	}
+
 	for header, value in r.headers._kv {
 		ws(b, header) // already has newlines escaped.
 		ws(b, ": ")
@@ -337,6 +343,7 @@ response_send_got_body :: proc(r: ^Response, will_close: bool) {
 
 	if will_close {
 		if !connection_set_state(r._conn, .Will_Close) { return }
+		_response_ensure_close_header(r)
 	}
 
 	if bytes.buffer_length(&r._buf) == 0 {
@@ -353,6 +360,27 @@ response_send_got_body :: proc(r: ^Response, will_close: bool) {
 	nbio.send_poly(conn.socket, {buf}, conn, on_response_sent)
 }
 
+
+// Makes sure the response tells the client the connection is closed (RFC 9112 9.6), also when
+// the heading was already written by the time we decided to close.
+@(private)
+_response_ensure_close_header :: proc(r: ^Response) {
+	if !r._heading_written {
+		headers_set_close(&r.headers)
+		return
+	}
+	if r._close_written { return }
+
+	CLOSE :: "connection: close\r\n"
+	// Insert right before the empty line that ends the heading.
+	at := r._heading_len - 2
+	old_len := bytes.buffer_length(&r._buf)
+	resize(&r._buf.buf, old_len + len(CLOSE))
+	copy(r._buf.buf[at + len(CLOSE):], r._buf.buf[at:old_len])
+	copy(r._buf.buf[at:], CLOSE)
+	r._heading_len  += len(CLOSE)
+	r._close_written = true
+}
 
 @(private)
 on_response_sent :: proc(op: ^nbio.Operation, conn: ^Connection) {

@@ -2,7 +2,9 @@
 package tests_server
 
 import "core:bytes"
+import "core:io"
 import "core:net"
+import "core:strings"
 import "core:sync"
 import "core:testing"
 import "core:thread"
@@ -115,6 +117,37 @@ echo_handler :: proc() -> http.Handler {
 				buf: [32]byte
 				http.respond_plain(res, fmt_bytes(buf[:], len(body)))
 			})
+			return
+		}
+		if req.url.path == "/trailer" {
+			Pair :: struct { req: ^http.Request, res: ^http.Response }
+			pair := new(Pair, context.temp_allocator)
+			pair^ = {req, res}
+			http.body(req, -1, pair, proc(pair: rawptr, body: http.Body, err: http.Body_Error) {
+				pair := (^Pair)(pair)
+				req, res := pair.req, pair.res
+				if err != nil {
+					http.respond(res, http.body_error_status(err))
+					return
+				}
+				t, has_t := http.headers_get(req.trailers, "x-t")
+				_, has_h := http.headers_get(req.headers, "x-t")
+				_, has_host_trailer := http.headers_get(req.trailers, "host")
+				http.respond_plain(res, strings.concatenate({
+					"trailer=", t if has_t else "<none>",
+					" header=", "yes" if has_h else "no",
+					" host-trailer=", "yes" if has_host_trailer else "no",
+					" body=", body,
+				}, context.temp_allocator))
+			})
+			return
+		}
+		if req.url.path == "/stream" {
+			res.status = .OK
+			rw: http.Response_Writer
+			w := http.response_writer_init(&rw, res, nil)
+			io.write_string(w, "streamed body")
+			io.close(w)
 			return
 		}
 		http.respond_plain(res, "hello")
