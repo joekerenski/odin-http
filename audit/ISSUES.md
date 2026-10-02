@@ -10,13 +10,13 @@ This file is the working checklist. Finding IDs (S/F/C) refer to [REPORT.md](REP
 ## Phase 0: Test infrastructure
 
 - [x] **T1** `tests/server`: black-box harness that starts a real server on an ephemeral port and talks raw bytes. (528aeb5)
-- [ ] **T2** Unit tests for every parser: request line, version, header line, Content-Length, chunk size, Transfer-Encoding list, Connection list, cookies, dates, URL / percent-decoding, MIME lookup.
+- [x] **T2** Unit tests for every parser: request line, version, header line, Content-Length, chunk size, Transfer-Encoding list, Connection list, cookies, dates, URL / percent-decoding, MIME lookup. (d1de7cf)
 - [x] **T3** Fuzz drivers for the parsers (random + mutational from a seed corpus) with invariants: no panic, bounded allocation, round-trip where applicable. Run in CI for a fixed time budget. (6c7ab4a)
 - [x] **T4** Pipelining / keep-alive tests: N requests on one connection with mixed bodies, verify exact response framing. (984d62c)
 - [ ] **T5** Concurrency tests: many connections across threads, shutdown under load, no leaks (tracking allocator) and clean ASan.
 - [ ] **T6** Client test harness: crafted-response server (status, framing, TLS with a local CA, truncation, slow responses).
 - [ ] **T7** Interop: real curl / Python clients against the server; real servers against the client; Caddy in front of the server (docker) for the pooled-connection cases.
-- [ ] **T8** CI: run all of the above on Linux, macOS and Windows; drop the non-compiling examples or fix them (S23).
+- [x] **T8** CI: run all of the above on Linux, macOS and Windows; drop the non-compiling examples or fix them (S23). (43d65f5)
 
 ## Phase 1: Server crashes and framing (critical / high)
 
@@ -48,26 +48,26 @@ This file is the working checklist. Finding IDs (S/F/C) refer to [REPORT.md](REP
 - [x] **S18** Per-thread cached Date (each loop updates its own once per second). (43d65f5)
 - [x] **S19** Shutdown: no busy loop; optional deadline after which active connections are force-closed. (43d65f5)
 - [x] **S20** `max_connections` per server; accept pauses at the cap and resumes on close. (43d65f5)
-- [ ] **A1** Replace remaining `assert`s on input-dependent paths with errors. Audit every `#no_bounds_check`.
+- [x] **A1** Replace remaining `assert`s on input-dependent paths with errors. Audit every `#no_bounds_check`. (43d65f5)
 
 ## Phase 3: Static files, routing, cookies
 
-- [ ] **F1** Zero-length / non-regular files: Content-Length 0 without reading; 404 for non-regular files (dirs, FIFOs, devices).
-- [ ] **F2, F9, F12** `respond_dir`:
+- [x] **F1** Zero-length / non-regular files: Content-Length 0 without reading; 404 for non-regular files (dirs, FIFOs, devices). (1d4b398)
+- [x] **F2, F9, F12** `respond_dir`: (1d4b398)
   - Component-wise prefix match.
   - Decode → clean → verify the result stays under the root.
   - Reject NUL/CTL.
   - Handle absolute targets.
   - Optional symlink policy.
-- [ ] **F3** Errors after the heading is written force `Connection: close`; short reads are errors.
-- [ ] **F5** Stream files (`nbio.sendfile` where available, bounded chunked reads otherwise); support `Range`/`If-Modified-Since`/`ETag` (P-phase).
-- [ ] **F4** Router: add a segment-based router (`/users/:id/edit`, `*rest`) as the default; keep Lua patterns opt-in with a max routed-path length and a documented `[^/]*` idiom.
-- [ ] **F8** Reject position captures `()` in `route_add`; bounds-check captures.
-- [ ] **F10** Proper origin-form / absolute-form target parsing, percent-decoding of path segments after routing, fragment stripping.
-- [ ] **F6, F14** Cookies: validate name (token) / value (cookie-octet) / domain / path on write; first-wins + tolerant parsing on read; ignore unknown attributes.
-- [ ] **F7, F13** Rate limiter: bounded table, IPv6 keyed by /64, exact limit, atomic sweep, Retry-After ≥ 1.
-- [ ] **F11** Invalid UTF-8 path → 400 once, not an error log per route.
-- [ ] **F15** MIME: case-insensitive, add common types, `charset=utf-8` for text, optional `X-Content-Type-Options: nosniff`.
+- [x] **F3** Errors after the heading is written force `Connection: close`; short reads are errors. (1d4b398)
+- [x] **F5** Stream files (`nbio.sendfile` where available, bounded chunked reads otherwise); support `Range`/`If-Modified-Since`/`ETag` (P-phase). (1d4b398)
+- [x] **F4** Router: add a segment-based router (`/users/:id/edit`, `*rest`) as the default; keep Lua patterns opt-in with a max routed-path length and a documented `[^/]*` idiom. (d1de7cf)
+- [x] **F8** Reject position captures `()` in `route_add`; bounds-check captures. (d1de7cf)
+- [x] **F10** Proper origin-form / absolute-form target parsing, percent-decoding of path segments after routing, fragment stripping. (d1de7cf)
+- [x] **F6, F14** Cookies: validate name (token) / value (cookie-octet) / domain / path on write; first-wins + tolerant parsing on read; ignore unknown attributes. (d1de7cf)
+- [x] **F7, F13** Rate limiter: bounded table, IPv6 keyed by /64, exact limit, atomic sweep, Retry-After ≥ 1. (d1de7cf)
+- [x] **F11** Invalid UTF-8 path → 400 once, not an error log per route. (d1de7cf)
+- [x] **F15** MIME: case-insensitive, add common types, `charset=utf-8` for text, optional `X-Content-Type-Options: nosniff`. (1d4b398)
 
 ## Phase 4: WebSockets (RFC 6455)
 
