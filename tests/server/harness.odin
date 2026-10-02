@@ -172,3 +172,47 @@ fmt_bytes :: proc(buf: []byte, n: int) -> string {
 	bytes.buffer_write_string(&b, " bytes")
 	return bytes.buffer_to_string(&b)
 }
+
+// A raw client connection for tests that need control over timing.
+Raw :: struct {
+	sock: net.TCP_Socket,
+}
+
+raw_dial :: proc(ts: ^Test_Server) -> (r: Raw, ok: bool) {
+	sock, err := net.dial_tcp(net.Endpoint{address = net.IP4_Loopback, port = ts.port})
+	if err != nil { return }
+	return {sock}, true
+}
+
+raw_send :: proc(r: Raw, data: string) -> bool {
+	sent := 0
+	for sent < len(data) {
+		n, err := net.send_tcp(r.sock, transmute([]byte)data[sent:])
+		if err != nil { return false }
+		sent += n
+	}
+	return true
+}
+
+// Reads whatever arrives within `wait`. `closed` reports whether the server closed the connection.
+raw_recv :: proc(r: Raw, wait: time.Duration, allocator := context.temp_allocator) -> (data: string, closed: bool) {
+	net.set_option(r.sock, .Receive_Timeout, wait)
+	out: bytes.Buffer
+	bytes.buffer_init_allocator(&out, 0, 512, allocator)
+	buf: [16384]byte
+	for {
+		n, err := net.recv_tcp(r.sock, buf[:])
+		if err != nil {
+			// Timeout: still open. A reset counts as closed.
+			closed = err != .Timeout && err != .Would_Block
+			break
+		}
+		if n == 0 { closed = true; break }
+		bytes.buffer_write(&out, buf[:n])
+	}
+	return bytes.buffer_to_string(&out), closed
+}
+
+raw_close :: proc(r: Raw) {
+	net.close(r.sock)
+}

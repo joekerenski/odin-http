@@ -3,9 +3,7 @@ package http
 import "base:runtime"
 
 import "core:bufio"
-import "core:bytes"
 import "core:c/libc"
-import "core:fmt"
 import "core:log"
 import "core:mem"
 import "core:mem/virtual"
@@ -13,24 +11,24 @@ import "core:nbio"
 import "core:net"
 import "core:os"
 import "core:slice"
+import "core:strings"
 import "core:sync"
 import "core:thread"
 import "core:time"
 
 Server_Opts :: struct {
 	// Whether the server should accept every request that sends a "Expect: 100-continue" header automatically.
+	// The interim 100 response is sent when the handler starts reading the body.
 	// Defaults to true.
 	auto_expect_continue:    bool,
 	// When this is true, any HEAD request is automatically redirected to the handler as a GET request.
-	// Then, when the response is sent, the body is removed from the response.
+	// The body is never sent for a HEAD request.
 	// Defaults to true.
 	redirect_head_to_get:    bool,
 	// Limit the maximum number of bytes to read for the request line (first line of request containing the URI).
 	// The HTTP spec does not specify any limits but in practice it is safer.
-	// RFC 7230 3.1.1 says:
-	// Various ad hoc limitations on request-line length are found in
-	// practice.  It is RECOMMENDED that all HTTP senders and recipients
-	// support, at a minimum, request-line lengths of 8000 octets.
+	// RFC 9112 3: It is RECOMMENDED that all HTTP senders and recipients support,
+	// at a minimum, request-line lengths of 8000 octets.
 	// defaults to 8000.
 	limit_request_line:      int,
 	// Limit the total size of the header section (and, separately, of the trailer section), in bytes,
@@ -44,17 +42,29 @@ Server_Opts :: struct {
 	// with the `max_length` argument of `body`, but never for more.
 	// Bodies over the limit get a 413 and the connection is closed. Defaults to 8MiB.
 	max_body_size:           int,
-	// The thread count to use, defaults to your core count - 1.
+	// The thread count to use, defaults to your core count.
 	thread_count:            int,
+	// The maximum number of open connections, across all threads. When reached, the server stops
+	// accepting (new connections wait in the kernel's backlog) until a connection closes.
+	// 0 means no limit other than the operating system's.
+	max_connections:         int,
 
-	// // The initial size of the temp_allocator for each connection, defaults to 256KiB and doubles
-	// // each time it needs to grow.
-	// // NOTE: this value is assigned globally, running multiple servers with a different value will
-	// // not work.
-	// initial_temp_block_cap:  uint,
-	// // The amount of free blocks each thread is allowed to hold on to before deallocating excess.
-	// // Defaults to 64.
-	// max_free_blocks_queued:  uint,
+	// Timeouts. A zero value means the default, a negative value disables the timeout.
+	//
+	// How long a keep-alive connection may sit idle waiting for the next request. Defaults to 3 minutes.
+	// When the server runs behind a reverse proxy that pools connections, keep this above the
+	// proxy's idle timeout (Caddy: 2 minutes), so the proxy is the one closing idle connections.
+	idle_timeout:            time.Duration,
+	// How long the client may take to send a request head (request line + headers). Exceeding
+	// it gets a 408 and the connection is closed. Defaults to 30 seconds.
+	header_timeout:          time.Duration,
+	// How long a body read may go without receiving any data. Defaults to 30 seconds.
+	body_read_timeout:       time.Duration,
+	// How long a response write may go without making any progress. Defaults to 30 seconds.
+	write_timeout:           time.Duration,
+	// How long a graceful shutdown waits for active requests before forcefully closing their
+	// connections. Defaults to 30 seconds.
+	shutdown_timeout:        time.Duration,
 }
 
 Default_Server_Opts := Server_Opts {
@@ -64,8 +74,11 @@ Default_Server_Opts := Server_Opts {
 	limit_headers           = 8000,
 	limit_header_count      = 100,
 	max_body_size           = 8 * mem.Megabyte,
-	// initial_temp_block_cap  = 256 * mem.Kilobyte,
-	// max_free_blocks_queued  = 64,
+	idle_timeout            = 3 * time.Minute,
+	header_timeout          = 30 * time.Second,
+	body_read_timeout       = 30 * time.Second,
+	write_timeout           = 30 * time.Second,
+	shutdown_timeout        = 30 * time.Second,
 }
 
 Server_State :: enum {
@@ -88,33 +101,36 @@ Server :: struct {
 	threads:        []Server_Thread,
 	// Once the server starts closing/shutdown this is set to true, all threads will check it
 	// and start their thread local shutdown procedure.
-	//
-	// NOTE: This is only ever set from false to true, and checked repeatedly,
-	// so it doesn't have to be atomic, this is purely to keep the thread sanitizer happy.
 	closing:        Atomic(bool),
 	// Threads will decrement the wait group when they have fully closed/shutdown.
 	// The main thread waits on this to clean up global data and return.
 	threads_closed: sync.Wait_Group,
-
-	// Updated every second with an updated date, this speeds up the server considerably
-	// because it would otherwise need to call time.now() and format the date on each response.
-	date:           Server_Date,
+	// Open connections across all threads, used for `max_connections`.
+	conn_count:     Atomic(int),
 }
 
 Server_Thread :: struct {
-	thread:     ^thread.Thread,
-	event_loop: ^nbio.Event_Loop,
-	conns:      map[net.TCP_Socket]^Connection,
-	state:      Server_State,
-	accept:     ^nbio.Operation,
+	server:       ^Server,
+	thread:       ^thread.Thread,
+	event_loop:   ^nbio.Event_Loop,
+	conns:        map[net.TCP_Socket]^Connection,
+	state:        Server_State,
+	accept:       ^nbio.Operation,
+	// A pending timer that re-arms accepting (back-off after errors, or waiting for room under
+	// `max_connections`).
+	accept_retry: ^nbio.Operation,
 
-	// free_temp_blocks:       map[int]queue.Queue(^Block),
-	// free_temp_blocks_count: int,
+	// Updated every second with an updated date, this speeds up the server considerably
+	// because it would otherwise need to call time.now() and format the date on each response.
+	// Every thread has its own, so no synchronization is needed.
+	date:         Server_Date,
+	date_timer:   ^nbio.Operation,
+	signal_timer: ^nbio.Operation,
 }
 
 @(private, disabled = ODIN_DISABLE_ASSERT)
 assert_has_td :: #force_inline proc(loc := #caller_location) {
-	assert(td.state != .Uninitialized, "The thread you are calling from is not a server/handler thread", loc)
+	assert(td != nil && td.state != .Uninitialized, "The thread you are calling from is not a server/handler thread", loc)
 }
 
 @(thread_local)
@@ -136,19 +152,23 @@ listen :: proc(
 	if s.opts.limit_headers      <= 0 { s.opts.limit_headers      = Default_Server_Opts.limit_headers }
 	if s.opts.limit_header_count <= 0 { s.opts.limit_header_count = Default_Server_Opts.limit_header_count }
 	if s.opts.max_body_size      <= 0 { s.opts.max_body_size      = Default_Server_Opts.max_body_size }
+	if s.opts.max_connections    <  0 { s.opts.max_connections    = 0 }
+	if s.opts.idle_timeout       == 0 { s.opts.idle_timeout       = Default_Server_Opts.idle_timeout }
+	if s.opts.header_timeout     == 0 { s.opts.header_timeout     = Default_Server_Opts.header_timeout }
+	if s.opts.body_read_timeout  == 0 { s.opts.body_read_timeout  = Default_Server_Opts.body_read_timeout }
+	if s.opts.write_timeout      == 0 { s.opts.write_timeout      = Default_Server_Opts.write_timeout }
+	if s.opts.shutdown_timeout   == 0 { s.opts.shutdown_timeout   = Default_Server_Opts.shutdown_timeout }
 	s.conn_allocator = context.allocator
-	// initial_block_cap = int(s.opts.initial_temp_block_cap)
-	// max_free_blocks_queued = int(s.opts.max_free_blocks_queued)
 
-	acquire_err := nbio.acquire_thread_event_loop()
-	// TODO: error handling.
-	assert(acquire_err == nil)
+	if acquire_err := nbio.acquire_thread_event_loop(); acquire_err != nil {
+		log.errorf("could not acquire event loop: %v", acquire_err)
+		return net.Create_Socket_Error.Insufficient_Resources
+	}
 
 	s.tcp_sock, err = nbio.listen_tcp(endpoint)
 	if err != nil {
-		nbio.run()
 		nbio.release_thread_event_loop()
-		server_shutdown(s)
+		atomic_store(&s.closing, true)
 	}
 	return
 }
@@ -168,9 +188,6 @@ serve :: proc(s: ^Server, h: Handler) -> (err: net.Network_Error) {
 		td.thread = thread.create_and_start_with_poly_data2(s, &td, _server_thread_init, context)
 	}
 
-	// Start keeping track of and caching the date for the required date header.
-	server_date_start(s)
-
 	_server_thread_init(s, &s.threads[0])
 
 	sync.wait(&s.threads_closed)
@@ -180,7 +197,7 @@ serve :: proc(s: ^Server, h: Handler) -> (err: net.Network_Error) {
 	net.shutdown(s.tcp_sock, .Both)
 	net.close(s.tcp_sock)
 	for t in s.threads[1:] { thread.destroy(t.thread) }
-	delete(s.threads)
+	delete(s.threads, s.conn_allocator)
 
 	return nil
 }
@@ -197,32 +214,44 @@ listen_and_serve :: proc(
 
 _server_thread_init :: proc(s: ^Server, ttd: ^Server_Thread) {
 	td = ttd
+	td.server = s
 
 	td.conns = make(map[net.TCP_Socket]^Connection)
-	// td.free_temp_blocks = make(map[int]queue.Queue(^Block))
 
 	if td != &s.threads[0] {
-		err := nbio.acquire_thread_event_loop()
-		// TODO: error handling.
-		assert(err == nil)
+		if err := nbio.acquire_thread_event_loop(); err != nil {
+			// Can't serve on this thread, the others carry on.
+			log.errorf("server thread could not acquire an event loop: %v", err)
+			delete(td.conns)
+			sync.wait_group_done(&s.threads_closed)
+			return
+		}
 	}
 
 	td.event_loop = nbio.current_thread_event_loop()
 
-	log.debug("accepting connections")
+	// Start keeping track of and caching the date for the required date header.
+	server_date_start(td)
 
-	td.accept = nbio.accept_poly(s.tcp_sock, s, on_accept)
+	if td == &s.threads[0] && atomic_load(&on_interrupt_server) == s {
+		_server_watch_interrupts(td)
+	}
+
+	log.debug("accepting connections")
+	server_accept(td)
 
 	log.debug("starting event loop")
 	td.state = .Serving
-	for {
-		if atomic_load(&s.closing) { _server_thread_shutdown(s) }
-		if td.state == .Closed { break }
-		if td.state == .Cleaning { continue }
+	for td.state != .Closed {
+		if atomic_load(&s.closing) {
+			_server_thread_shutdown(s)
+			break
+		}
 
 		err := nbio.tick()
 		if err != nil {
 			log.errorf("non-blocking io tick error: %v", err)
+			_server_thread_shutdown(s)
 			break
 		}
 	}
@@ -235,25 +264,26 @@ _server_thread_init :: proc(s: ^Server, ttd: ^Server_Thread) {
 	sync.wait_group_done(&s.threads_closed)
 }
 
-
 // The time between checks and closes of connections in a graceful shutdown.
 @(private)
 SHUTDOWN_INTERVAL :: time.Millisecond * 100
 
 // Starts a graceful shutdown.
 //
-// Some error logs will be generated but all active connections are finished
-// before closing them and all connections and threads are freed.
-//
-// 1. Stops 'server_start' from accepting new connections.
+// 1. Stops 'serve' from accepting new connections.
 // 2. Close and free non-active connections.
 // 3. Repeat 2 every SHUTDOWN_INTERVAL until no more connections are open.
+//    After `Server_Opts.shutdown_timeout`, active connections are shut down forcefully.
 // 4. Close the main socket.
-// 5. Signal 'server_start' it can return.
+// 5. Signal 'serve' it can return.
+//
+// Safe to call from any thread.
 server_shutdown :: proc(s: ^Server) {
 	atomic_store(&s.closing, true)
 	for t in s.threads {
-		nbio.wake_up(t.event_loop)
+		if t.event_loop != nil {
+			nbio.wake_up(t.event_loop)
+		}
 	}
 }
 
@@ -262,26 +292,30 @@ _server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
 
 	td.state = .Closing
 	defer delete(td.conns)
-	// defer {
-	// 	blocks: int
-	// 	for _, &bucket in td.free_temp_blocks {
-	// 		for block in queue.pop_front_safe(&bucket) {
-	// 			blocks += 1
-	// 			free(block)
-	// 		}
-	// 		queue.destroy(&bucket)
-	// 	}
-	// 	delete(td.free_temp_blocks)
-	// 	log.infof("had %i temp blocks to spare", blocks)
-	// }
 
-	for {
+	nbio.remove(td.accept);       td.accept       = nil
+	nbio.remove(td.accept_retry); td.accept_retry = nil
+	nbio.remove(td.date_timer);   td.date_timer   = nil
+	nbio.remove(td.signal_timer); td.signal_timer = nil
+
+	start  := time.tick_now()
+	forced := false
+	for len(td.conns) > 0 {
+		force := s.opts.shutdown_timeout > 0 && time.tick_since(start) > s.opts.shutdown_timeout
+
 		for sock, conn in td.conns {
 			#partial switch conn.state {
-			case .Active:
-				log.infof("shutdown: connection %i still active", sock)
+			case .Active, .Will_Close:
+				if force && !forced {
+					// Shutting the socket down makes the pending operations of the connection
+					// fail, which runs the normal cleanup path.
+					log.warnf("shutdown: forcefully closing active connection %i", sock)
+					net.shutdown(sock, .Both)
+				} else {
+					log.debugf("shutdown: connection %i still active", sock)
+				}
 			case .New, .Idle, .Pending:
-				log.infof("shutdown: closing connection %i", sock)
+				log.debugf("shutdown: closing connection %i", sock)
 				connection_close(conn)
 			case .Closing:
 				log.debugf("shutdown: connection %i is closing", sock)
@@ -289,19 +323,23 @@ _server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
 				log.warn("closed connection in connections map, maybe a race or logic error")
 			}
 		}
+		if force { forced = true }
 
-		if len(td.conns) == 0 {
+		// Give up on connections that don't finish even after being shut down: their handler never
+		// responded and has no I/O pending. Their memory is leaked on purpose, the handler may
+		// still hold on to the request/response.
+		if forced && time.tick_since(start) > 2 * s.opts.shutdown_timeout + 2 * Conn_Close_Delay {
+			log.warnf("shutdown: abandoning %i connections whose handlers never responded", len(td.conns))
 			break
 		}
 
-		err := nbio.tick()
-		fmt.assertf(err == nil, "IO tick error during shutdown: %v")
+		if err := nbio.tick(SHUTDOWN_INTERVAL); err != nil {
+			log.errorf("IO tick error during shutdown: %v", err)
+			break
+		}
 	}
 
 	td.state = .Cleaning
-
-	nbio.remove(td.accept)
-	td.accept = nil
 
 	nbio.run()
 	nbio.release_thread_event_loop()
@@ -312,29 +350,36 @@ _server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
 }
 
 @(private)
-on_interrupt_server: ^Server
+on_interrupt_server: Atomic(^Server)
 @(private)
-on_interrupt_context: runtime.Context
+interrupt_count: Atomic(int)
 
-// Registers a signal handler to shutdown the server gracefully on interrupt signal.
-// Can only be called once in the lifetime of the program because of a hacky interaction with libc.
+// Registers a SIGINT handler to shutdown the server gracefully. A second SIGINT exits immediately.
+//
+// Call this before `serve`. Only one server can be registered.
 server_shutdown_on_interrupt :: proc(s: ^Server) {
-	on_interrupt_server = s
-	on_interrupt_context = context
+	atomic_store(&on_interrupt_server, s)
 
-	libc.signal(
-		libc.SIGINT,
-		proc "cdecl" (_: i32) {
-			context = on_interrupt_context
+	// Only async-signal-safe things happen here: an atomic increment and _Exit. The server
+	// notices the interrupt from a timer on its first thread.
+	libc.signal(libc.SIGINT, proc "c" (_: i32) {
+		if sync.atomic_add(&interrupt_count.raw, 1) >= 1 {
+			libc._Exit(1)
+		}
+	})
+}
 
-			// Force close on second signal.
-			if td.state == .Closing {
-				os.exit(1)
-			}
-
-			server_shutdown(on_interrupt_server)
-		},
-	)
+@(private)
+_server_watch_interrupts :: proc(td: ^Server_Thread) {
+	td.signal_timer = nbio.timeout_poly(100 * time.Millisecond, td, proc(_: ^nbio.Operation, td: ^Server_Thread) {
+		td.signal_timer = nil
+		if atomic_load(&interrupt_count) > 0 {
+			log.info("interrupt received, shutting down")
+			server_shutdown(td.server)
+			return
+		}
+		_server_watch_interrupts(td)
+	})
 }
 
 // Taken from Go's implementation,
@@ -380,6 +425,12 @@ Connection :: struct {
 	scanner:        Scanner,
 	temp_allocator: virtual.Arena,
 	loop:           Loop,
+
+	// The in-flight write, see `connection_send`.
+	send_buf:       []byte,
+	send_done:      proc(c: ^Connection, ok: bool),
+	// State of a pending "100 Continue" write.
+	continue_state: rawptr,
 }
 
 // Loop/request cycle state.
@@ -392,12 +443,56 @@ Loop :: struct {
 	header_count:      int,
 }
 
+// Writes all of `buf` to the connection, failing if no progress is made for `write_timeout`.
+// Only one write can be in flight per connection.
+@(private)
+connection_send :: proc(c: ^Connection, buf: []byte, done: proc(c: ^Connection, ok: bool)) {
+	assert(c.send_done == nil, "a write is already in flight on this connection")
+
+	if len(buf) == 0 {
+		done(c, true)
+		return
+	}
+
+	c.send_buf  = buf
+	c.send_done = done
+
+	timeout := c.server.opts.write_timeout if c.server.opts.write_timeout > 0 else nbio.NO_TIMEOUT
+	nbio.send_poly(c.socket, {c.send_buf}, c, on_sent, all = false, timeout = timeout)
+
+	on_sent :: proc(op: ^nbio.Operation, c: ^Connection) {
+		if op.send.err != nil {
+			if op.send.err == net.TCP_Send_Error.Timeout {
+				log.infof("write timed out on connection %i", c.socket)
+			} else {
+				log.debugf("could not send on connection %i: %v", c.socket, op.send.err)
+			}
+			done := c.send_done
+			c.send_done = nil
+			c.send_buf  = nil
+			done(c, false)
+			return
+		}
+
+		c.send_buf = c.send_buf[op.send.sent:]
+		if len(c.send_buf) > 0 {
+			timeout := c.server.opts.write_timeout if c.server.opts.write_timeout > 0 else nbio.NO_TIMEOUT
+			nbio.send_poly(c.socket, {c.send_buf}, c, on_sent, all = false, timeout = timeout)
+			return
+		}
+
+		done := c.send_done
+		c.send_done = nil
+		done(c, true)
+	}
+}
+
 @(private)
 connection_close :: proc(c: ^Connection, loc := #caller_location) {
 	assert_has_td(loc)
 
 	if c.state >= .Closing {
-		log.infof("connection %i already closing/closed", c.socket)
+		log.debugf("connection %i already closing/closed", c.socket)
 		return
 	}
 
@@ -405,9 +500,7 @@ connection_close :: proc(c: ^Connection, loc := #caller_location) {
 
 	c.state = .Closing
 
-	// RFC 7230 6.6.
-
-	// Close read side of the connection, then wait a little bit, allowing the client
+	// RFC 9112 9.6: close the write side first, then wait a little bit, allowing the client
 	// to process the closing and receive any remaining data.
 	net.shutdown(c.socket, net.Shutdown_Manner.Send)
 
@@ -417,13 +510,43 @@ connection_close :: proc(c: ^Connection, loc := #caller_location) {
 
 			c.state = .Closed
 
-			// allocator_destroy(&c.temp_allocator)
 			virtual.arena_destroy(&c.temp_allocator)
 
 			scanner_destroy(&c.scanner)
 			delete_key(&td.conns, c.socket)
-			free(c, c.server.conn_allocator)
+			server := c.server
+			free(c, server.conn_allocator)
+
+			sync.atomic_sub(&server.conn_count.raw, 1)
+			if td.accept == nil && td.accept_retry == nil && td.state == .Serving {
+				server_accept(td)
+			}
 		})
+	})
+}
+
+// Starts accepting a connection on the given server thread, unless the connection limit is reached,
+// then it checks again shortly.
+@(private)
+server_accept :: proc(td: ^Server_Thread) {
+	s := td.server
+	if td.state > .Serving && td.state != .Uninitialized { return }
+	if atomic_load(&s.closing) { return }
+
+	if s.opts.max_connections > 0 && atomic_load(&s.conn_count) >= s.opts.max_connections {
+		server_accept_retry(td, 50 * time.Millisecond)
+		return
+	}
+
+	td.accept = nbio.accept_poly(s.tcp_sock, s, on_accept)
+}
+
+@(private)
+server_accept_retry :: proc(td: ^Server_Thread, after: time.Duration) {
+	if td.accept_retry != nil { return }
+	td.accept_retry = nbio.timeout_poly(after, td, proc(_: ^nbio.Operation, td: ^Server_Thread) {
+		td.accept_retry = nil
+		server_accept(td)
 	})
 }
 
@@ -433,19 +556,29 @@ on_accept :: proc(op: ^nbio.Operation, server: ^Server) {
 
 	if op.accept.err != nil {
 		#partial switch op.accept.err {
+		case .Aborted, .Interrupted, .Would_Block, .Timeout:
+			// Transient, the client went away or we got interrupted.
+			log.debugf("accept: %v, retrying", op.accept.err)
+			server_accept(td)
 		case .Insufficient_Resources:
-			log.error("Connection limit reached, trying again in a bit")
-			nbio.timeout_poly(time.Second, server, proc(_: ^nbio.Operation, server: ^Server) {
-				td.accept = nbio.accept_poly(server.tcp_sock, server, on_accept)
-			})
-			return
+			log.error("accept: out of resources (file descriptors?), trying again in a bit")
+			server_accept_retry(td, 100 * time.Millisecond)
+		case .Not_Listening, .Invalid_Argument, .Unsupported_Socket:
+			// The listening socket is gone (shutdown) or unusable, nothing to retry.
+			if !atomic_load(&server.closing) {
+				log.errorf("accept: %v, this thread stops accepting connections", op.accept.err)
+			}
+		case:
+			log.errorf("accept: %v, retrying in a second", op.accept.err)
+			server_accept_retry(td, time.Second)
 		}
-
-		fmt.panicf("accept error: %v", op.accept.err)
+		return
 	}
 
+	sync.atomic_add(&server.conn_count.raw, 1)
+
 	// Accept next connection.
-	td.accept = nbio.accept_poly(server.tcp_sock, server, on_accept)
+	server_accept(td)
 
 	c := new(Connection, server.conn_allocator)
 	c.state = .New
@@ -461,13 +594,14 @@ on_accept :: proc(op: ^nbio.Operation, server: ^Server) {
 
 @(private)
 conn_handle_reqs :: proc(c: ^Connection) {
-	// TODO/PERF: not sure why this is allocated on the connections allocator, can't it use the arena?
 	scanner_init(&c.scanner, c, c.server.conn_allocator)
 
-	// allocator_init(&c.temp_allocator, c.server.conn_allocator)
-	// context.temp_allocator = allocator(&c.temp_allocator)
-	err := virtual.arena_init_growing(&c.temp_allocator)
-	assert(err == nil)
+	if err := virtual.arena_init_growing(&c.temp_allocator); err != nil {
+		log.errorf("could not allocate connection arena: %v", err)
+		c.state = .Will_Close
+		connection_close(c)
+		return
+	}
 	context.temp_allocator = virtual.arena_allocator(&c.temp_allocator)
 
 	conn_handle_req(c, context.temp_allocator)
@@ -489,7 +623,17 @@ conn_handle_req :: proc(c: ^Connection, allocator := context.temp_allocator) {
 		if !connection_set_state(l.conn, .Active) { return }
 
 		if err != nil {
-			if err == .EOF {
+			if l.conn.scanner.timed_out {
+				// Nothing received: an idle connection timing out, close quietly. Part of a request
+				// received: tell the client.
+				if l.conn.scanner.end > l.conn.scanner.start {
+					log.info("request-line timed out")
+					l.req.line = Requestline{version = {1, 1}}
+					reject(l, .Request_Timeout)
+					return
+				}
+				log.debug("idle connection timed out")
+			} else if err == .EOF {
 				log.debugf("client disconnected (EOF)")
 			} else if err == .Too_Long {
 				log.info("request-line too long")
@@ -512,6 +656,10 @@ conn_handle_req :: proc(c: ^Connection, allocator := context.temp_allocator) {
 			scanner_scan(&l.conn.scanner, loop, on_rline2)
 			return
 		}
+
+		// The rest of the request head has to arrive within `header_timeout` from now.
+		opts := l.conn.server.opts
+		l.conn.scanner.deadline = time.time_add(nbio.now(), opts.header_timeout) if opts.header_timeout > 0 else {}
 
 		on_rline2(loop, token, err)
 	}
@@ -571,7 +719,12 @@ conn_handle_req :: proc(c: ^Connection, allocator := context.temp_allocator) {
 		l := cast(^Loop)loop
 
 		if err != nil {
-			log.warnf("request scanning error: %v", err)
+			if l.conn.scanner.timed_out {
+				log.info("request headers timed out")
+				reject(l, .Request_Timeout)
+				return
+			}
+			log.infof("request scanning error: %v", err)
 			if err == .Too_Long {
 				reject(l, .Request_Header_Fields_Too_Large)
 				return
@@ -616,6 +769,11 @@ conn_handle_req :: proc(c: ^Connection, allocator := context.temp_allocator) {
 
 		l.conn.scanner.max_token_size = bufio.DEFAULT_MAX_SCAN_TOKEN_SIZE
 
+		// Body reads are bound by a per-read timeout instead of a deadline, so large uploads
+		// work as long as data keeps flowing.
+		l.conn.scanner.deadline     = {}
+		l.conn.scanner.read_timeout = l.conn.server.opts.body_read_timeout
+
 		rline := &l.req.line.(Requestline)
 		// An options request with the "*" is a no-op/ping request to
 		// check for server capabilities and should not be sent to handlers.
@@ -641,6 +799,11 @@ conn_handle_req :: proc(c: ^Connection, allocator := context.temp_allocator) {
 	request_init(&c.loop.req, allocator)
 	response_init(&c.loop.res, allocator)
 
+	// A fresh connection has `header_timeout` to send its first request, a keep-alive connection
+	// may wait `idle_timeout` for the next one.
+	wait := c.server.opts.idle_timeout if c.state == .Idle else c.server.opts.header_timeout
+	c.scanner.deadline = time.time_add(nbio.now(), wait) if wait > 0 else {}
+
 	c.scanner.max_token_size = c.server.opts.limit_request_line
 	scanner_scan(&c.scanner, &c.loop, on_rline1)
 }
@@ -648,28 +811,30 @@ conn_handle_req :: proc(c: ^Connection, allocator := context.temp_allocator) {
 // A buffer that will contain the date header for the current second.
 @(private)
 Server_Date :: struct {
-	buf_backing: [DATE_LENGTH]byte,
-	buf:         bytes.Buffer,
+	buf: [DATE_LENGTH]byte,
 }
 
 @(private)
-server_date_start :: proc(s: ^Server) {
-	s.date.buf.buf = slice.into_dynamic(s.date.buf_backing[:])
-	server_date_update(nil, s)
+server_date_start :: proc(td: ^Server_Thread) {
+	server_date_update(nil, td)
 }
 
 // Updates the time and schedules itself for after a second.
 @(private)
-server_date_update :: proc(_: ^nbio.Operation, s: ^Server) {
-	if atomic_load(&s.closing) { return }
+server_date_update :: proc(_: ^nbio.Operation, td: ^Server_Thread) {
+	td.date_timer = nil
+	if atomic_load(&td.server.closing) { return }
 
-	nbio.timeout_poly(time.Second, s, server_date_update)
+	td.date_timer = nbio.timeout_poly(time.Second, td, server_date_update)
 
-	bytes.buffer_reset(&s.date.buf)
-	date_write(bytes.buffer_to_stream(&s.date.buf), time.now())
+	b: strings.Builder
+	b.buf = slice.into_dynamic(td.date.buf[:])
+	date_write(strings.to_writer(&b), time.now())
 }
 
+// The cached date of the calling server thread.
 @(private)
-server_date :: proc(s: ^Server) -> string {
-	return string(s.date.buf_backing[:])
+server_date :: proc(_: ^Server) -> string {
+	assert_has_td()
+	return string(td.date.buf[:])
 }

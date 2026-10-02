@@ -4,7 +4,6 @@ import "core:bufio"
 import "core:io"
 import "core:log"
 import "core:mem/virtual"
-import "core:nbio"
 import "core:net"
 import "core:strings"
 
@@ -87,10 +86,12 @@ _body_send_continue :: proc(req: ^Request, limit: int, user_data: rawptr, cb: Bo
 	st^ = {req, limit, user_data, cb}
 
 	conn := req._scanner.connection
-	nbio.send_poly(conn.socket, {transmute([]byte)string(CONTINUE)}, st, proc(op: ^nbio.Operation, st: ^Continue_State) {
-		context.temp_allocator = virtual.arena_allocator(&st.req._scanner.connection.temp_allocator)
-		if op.send.err != nil {
-			log.infof("could not send 100 continue: %v", op.send.err)
+	conn.continue_state = st
+	connection_send(conn, transmute([]byte)string(CONTINUE), proc(c: ^Connection, ok: bool) {
+		context.temp_allocator = virtual.arena_allocator(&c.temp_allocator)
+		st := (^Continue_State)(c.continue_state)
+		c.continue_state = nil
+		if !ok {
 			st.req._body_ok = false
 			st.cb(st.user_data, "", .Unknown)
 			return
@@ -98,6 +99,7 @@ _body_send_continue :: proc(req: ^Request, limit: int, user_data: rawptr, cb: Bo
 		_body_start(st.req, st.limit, st.user_data, st.cb)
 	})
 }
+
 /*
 Parses a URL encoded body, aka bodies with the 'Content-Type: application/x-www-form-urlencoded'.
 

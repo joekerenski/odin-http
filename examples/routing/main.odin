@@ -1,6 +1,5 @@
 package routing_example
 
-import "core:bytes"
 import "core:encoding/json"
 import "core:fmt"
 import "core:log"

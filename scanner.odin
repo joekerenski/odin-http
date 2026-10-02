@@ -7,6 +7,7 @@ import "base:intrinsics"
 import "core:bufio"
 import "core:nbio"
 import "core:net"
+import "core:time"
 
 Scan_Callback :: #type proc(user_data: rawptr, token: string, err: bufio.Scanner_Error)
 Split_Proc    :: #type proc(split_data: rawptr, data: []byte, at_eof: bool) -> (advance: int, token: []byte, err: bufio.Scanner_Error, final_token: bool)
@@ -49,6 +50,13 @@ Scanner :: struct /* #no_copy */ {
 	could_be_too_short:           bool,
 	user_data:                    rawptr,
 	callback:                     Scan_Callback,
+
+	// Maximum time a single read may wait for data, <= 0 for none.
+	read_timeout:                 time.Duration,
+	// Absolute deadline for the reads, zero for none.
+	deadline:                     time.Time,
+	// Set when a read failed because of `read_timeout` or `deadline`; the callback gets `.Unknown`.
+	timed_out:                    bool,
 }
 
 INIT_BUF_SIZE :: 1024
@@ -82,6 +90,9 @@ scanner_reset :: proc(s: ^Scanner) {
 	s.could_be_too_short           = false
 	s.user_data                    = nil
 	s.callback                     = nil
+	s.read_timeout                 = 0
+	s.deadline                     = {}
+	s.timed_out                    = false
 }
 
 scanner_scan :: proc(
@@ -214,9 +225,26 @@ scanner_scan :: proc(
 	s.callback = callback
 	s.could_be_too_short = could_be_too_short
 
+	timeout := nbio.NO_TIMEOUT
+	if s.read_timeout > 0 {
+		timeout = s.read_timeout
+	}
+	if s.deadline != {} {
+		left := time.diff(nbio.now(), s.deadline)
+		if left <= 0 {
+			s.timed_out = true
+			set_err(s, .Unknown)
+			s.callback, s.user_data = nil, nil
+			callback(user_data, "", s._err)
+			return
+		}
+		if timeout == nbio.NO_TIMEOUT || left < timeout {
+			timeout = left
+		}
+	}
+
 	assert_has_td()
-	// TODO: some kinda timeout on this.
-	nbio.recv_poly(s.connection.socket, {s.buf[s.end:len(s.buf)]}, s, scanner_on_read)
+	nbio.recv_poly(s.connection.socket, {s.buf[s.end:len(s.buf)]}, s, scanner_on_read, timeout = timeout)
 }
 
 scanner_on_read :: proc(op: ^nbio.Operation, s: ^Scanner) {
@@ -229,6 +257,10 @@ scanner_on_read :: proc(op: ^nbio.Operation, s: ^Scanner) {
 		case .Connection_Closed, .Invalid_Argument:
 			// EBADF (bad file descriptor) happens when OS closes socket.
 			s._err = .EOF
+			return
+		case .Timeout:
+			s.timed_out = true
+			s._err = .Unknown
 			return
 		}
 

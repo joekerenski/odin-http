@@ -3,6 +3,8 @@ package tests_server
 import "core:strings"
 import "core:testing"
 
+import http "../.."
+
 // Many requests on one connection: every response must be framed exactly, in order.
 @(test)
 pipelined_mixed_bodies :: proc(t: ^testing.T) {
@@ -155,4 +157,21 @@ host_rules :: proc(t: ^testing.T) {
 	expect_status(t, "GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n", 400)
 	expect_status(t, "GET / HTTP/1.1\r\nHost : a\r\n\r\n", 400)
 	expect_status(t, "GET / HTTP/1.1\r\nHost:a\r\n\r\n", 200)
+}
+
+@(test)
+response_header_injection_dropped :: proc(t: ^testing.T) {
+	h := http.handler(proc(_: ^http.Request, res: ^http.Response) {
+		http.headers_set(&res.headers, "x-ok", "fine")
+		http.headers_set(&res.headers, "x-inject", "a\r\nInjected: 1")
+		http.headers_set(&res.headers, "x-cr", "a\rb")
+		http.headers_set(&res.headers, "bad name", "v")
+		http.headers_set(&res.headers, "x-nl\nInjected", "v")
+		http.respond_plain(res, "hello")
+	})
+	ts := server_start(t, h)
+	defer server_stop(ts)
+	resp := roundtrip(ts, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+	testing.expectf(t, status_of(resp) == 200 && strings.contains(resp, "x-ok: fine\r\n"), "got %q", resp)
+	testing.expectf(t, !strings.contains(resp, "Injected") && !strings.contains(resp, "x-cr") && !strings.contains(resp, "bad name"), "got %q", resp)
 }

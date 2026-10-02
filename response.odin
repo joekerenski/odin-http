@@ -4,7 +4,6 @@ import "core:bytes"
 import "core:io"
 import "core:log"
 import "core:mem/virtual"
-import "core:nbio"
 import "core:slice"
 import "core:strconv"
 
@@ -274,9 +273,15 @@ _response_write_heading :: proc(r: ^Response, content_length: int) {
 	}
 
 	for header, value in r.headers._kv {
-		ws(b, header) // already has newlines escaped.
+		// A name that isn't a token or a value with CR/LF/NUL/other CTLs would let whoever controls
+		// it inject headers or split the response. Such a header is dropped, not "escaped".
+		if !is_token(header) || !is_field_value(value) {
+			log.warnf("dropping invalid response header %q (value %q)", header, value)
+			continue
+		}
+		ws(b, header)
 		ws(b, ": ")
-		write_escaped_newlines(bstream, value)
+		ws(b, value)
 		ws(b, "\r\n")
 	}
 
@@ -357,9 +362,9 @@ response_send_got_body :: proc(r: ^Response, will_close: bool) {
 	if conn.loop.req.is_head {
 		buf = buf[:r._heading_len]
 	}
-	nbio.send_poly(conn.socket, {buf}, conn, on_response_sent)
-}
 
+	connection_send(conn, buf, on_response_sent)
+}
 
 // Makes sure the response tells the client the connection is closed (RFC 9112 9.6), also when
 // the heading was already written by the time we decided to close.
@@ -383,9 +388,8 @@ _response_ensure_close_header :: proc(r: ^Response) {
 }
 
 @(private)
-on_response_sent :: proc(op: ^nbio.Operation, conn: ^Connection) {
-	if op.send.err != nil {
-		log.errorf("could not send response: %v", op.send.err)
+on_response_sent :: proc(conn: ^Connection, ok: bool) {
+	if !ok {
 		if !connection_set_state(conn, .Will_Close) { return }
 	}
 
