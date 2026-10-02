@@ -11,8 +11,12 @@ import "core:time"
 
 Requestline_Error :: enum {
 	None,
+	// The method is a valid token, but not one we implement: 501.
 	Method_Not_Implemented,
+	// Anything else that is malformed: 400.
 	Not_Enough_Fields,
+	Invalid_Method,
+	Invalid_Target,
 	Invalid_Version_Format,
 }
 
@@ -25,9 +29,10 @@ Requestline :: struct {
 	version: Version,
 }
 
-// A request-line begins with a method token, followed by a single space
-// (SP), the request-target, another single space (SP), the protocol
-// version, and ends with CRLF.
+// request-line = method SP request-target SP HTTP-version (RFC 9112 3).
+//
+// Exactly one SP separates the parts, the target must not contain CTLs/SP/DEL/non-ASCII,
+// and the version must be "HTTP/" DIGIT "." DIGIT.
 //
 // This allocates a clone of the target, because this is intended to be used with a scanner,
 // which has a buffer that changes every read.
@@ -37,20 +42,24 @@ requestline_parse :: proc(s: string, allocator := context.temp_allocator) -> (li
 	next_space := strings.index_byte(s, ' ')
 	if next_space == -1 { return line, .Not_Enough_Fields }
 
+	method_str := s[:next_space]
+	if !is_token(method_str) { return line, .Invalid_Method }
 	ok: bool
-	line.method, ok = method_parse(s[:next_space])
+	line.method, ok = method_parse(method_str)
 	if !ok { return line, .Method_Not_Implemented }
 	s = s[next_space + 1:]
 
 	next_space = strings.index_byte(s, ' ')
 	if next_space == -1 { return line, .Not_Enough_Fields }
 
-	line.target = strings.clone(s[:next_space], allocator)
-	s = s[len(line.target.(string)) + 1:]
+	target := s[:next_space]
+	if !is_request_target(target) { return line, .Invalid_Target }
+	s = s[next_space + 1:]
 
-	line.version, ok = version_parse(s)
+	line.version, ok = parse_http_version(s)
 	if !ok { return line, .Invalid_Version_Format }
 
+	line.target = strings.clone(target, allocator)
 	return
 }
 
@@ -77,21 +86,9 @@ Version :: struct {
 	minor: u8,
 }
 
-// Parses an HTTP version string according to RFC 7230, section 2.6.
+// Parses an HTTP version string ("HTTP/" DIGIT "." DIGIT, RFC 9112 2.3).
 version_parse :: proc(s: string) -> (version: Version, ok: bool) {
-	switch len(s) {
-	case 8:
-		(s[6] == '.') or_return
-		version.minor = u8(int(s[7]) - '0')
-		fallthrough
-	case 6:
-		(s[:5] == "HTTP/") or_return
-		version.major = u8(int(s[5]) - '0')
-	case:
-		return
-	}
-	ok = true
-	return
+	return parse_http_version(s)
 }
 
 version_write :: proc(w: io.Writer, v: Version) -> io.Error {
@@ -147,38 +144,38 @@ method_parse :: proc(m: string) -> (method: Method, ok: bool) #no_bounds_check {
 	return nil, false
 }
 
-// Parses the header and adds it to the headers if valid. The given string is copied.
+// Parses a field line (`field-name ":" OWS field-value OWS`) and adds it to the headers if valid.
+// The given string is copied.
+//
+// Rejected (RFC 9112 5, RFC 9110 5.5): field names that are not a token (this includes whitespace
+// before the colon and obs-fold continuation lines), values containing NUL/CR/LF/other CTLs,
+// a second Host field, and a second Content-Length that disagrees with the first.
 header_parse :: proc(headers: ^Headers, line: string, allocator := context.temp_allocator) -> (key: string, ok: bool) {
-	// Preceding spaces should not be allowed.
-	(len(line) > 0 && line[0] != ' ') or_return
-
 	colon := strings.index_byte(line, ':')
 	(colon > 0) or_return
 
-	// There must not be a space before the colon.
-	(line[colon - 1] != ' ') or_return
+	name  := line[:colon]
+	value := trim_ows(line[colon + 1:])
+	(is_token(name) && is_field_value(value)) or_return
 
-	// TODO/PERF: only actually relevant/needed if the key is one of these.
-	has_host   := headers_has_unsafe(headers^, "host")
-	cl, has_cl := headers_get_unsafe(headers^, "content-length")
-
-	value := strings.trim_space(line[colon + 1:])
-	tmp_key := sanitize_key(headers^, line[:colon])
+	tmp_key := sanitize_key(headers^, name)
 	defer if !ok { delete(tmp_key, allocator) }
 
-	// RFC 7230 5.4: Server MUST respond with 400 to any request
-	// with multiple "Host" header fields.
-	if tmp_key == "host" && has_host {
-		return
-	}
+	switch tmp_key {
+	case "host":
+		// RFC 9112 3.2: A server MUST respond with 400 to any request with multiple Host header fields.
+		if headers_has_unsafe(headers^, "host") { return }
 
-	// RFC 7230 3.3.3: If a message is received without Transfer-Encoding and with
-	// either multiple Content-Length header fields having differing
-	// field-values or a single Content-Length header field having an
-	// invalid value, then the message framing is invalid and the
-	// recipient MUST treat it as an unrecoverable error.
-	if tmp_key == "content-length" && has_cl && cl != value {
-		return
+	case "content-length":
+		// RFC 9112 6.3: differing Content-Length values make the framing invalid. Identical
+		// duplicates are tolerated and collapsed into one, so the stored value stays a single number.
+		if cl, has_cl := headers_get_unsafe(headers^, "content-length"); has_cl {
+			a, aok := parse_content_length(cl)
+			b, bok := parse_content_length(value)
+			(aok && bok && a == b) or_return
+			delete(tmp_key, allocator)
+			return "content-length", true
+		}
 	}
 
 	// RFC 9110 5.3: A recipient MAY combine multiple field lines within a field section

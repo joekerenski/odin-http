@@ -162,15 +162,7 @@ Prefer the procedure group `respond`.
 respond_with_none :: proc(r: ^Response, loc := #caller_location) {
 	assert_has_td(loc)
 
-	conn := r._conn
-	req  := conn.loop.req
-
-	// Respond as head request if we set it to get.
-	if rline, ok := req.line.(Requestline); ok && req.is_head && conn.server.opts.redirect_head_to_get {
-		rline.method = .Head
-	}
-
-	response_send(r, conn, loc)
+	response_send(r, r._conn, loc)
 }
 
 /*

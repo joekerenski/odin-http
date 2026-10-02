@@ -25,6 +25,8 @@ Response :: struct {
 	// connection (maybe a small buffer in this struct).
 	_buf:             bytes.Buffer,
 	_heading_written: bool,
+	// Length of the status line + headers in `_buf`, used to send only the heading for HEAD requests.
+	_heading_len:     int,
 }
 
 response_init :: proc(r: ^Response, allocator := context.allocator) {
@@ -279,6 +281,8 @@ _response_write_heading :: proc(r: ^Response, content_length: int) {
 
 	// Empty line denotes end of headers and start of body.
 	ws(b, "\r\n")
+
+	r._heading_len = bytes.buffer_length(b)
 }
 
 // Sends the response over the connection.
@@ -294,30 +298,36 @@ response_send :: proc(r: ^Response, conn: ^Connection, loc := #caller_location) 
 		will_close: bool
 
 		if err != nil {
-			// Any read error should close the connection.
-			response_status(res, body_error_status(err))
-			headers_set_close(&res.headers)
+			// The handler's response stands, but the connection is in an unknown state now.
+			log.debugf("could not drain request body: %v, closing connection", err)
 			will_close = true
 		}
 
 		response_send_got_body(res, will_close)
 	}
 
-	// RFC 7230 6.3: A server MUST read
-	// the entire request message body or close the connection after sending
-	// its response, since otherwise the remaining data on a persistent
-	// connection would be misinterpreted as the next request.
-	if !response_must_close(&conn.loop.req, r) {
+	req := &conn.loop.req
 
-		// Body has been drained during handling.
-		if _, got_body := conn.loop.req._body_ok.?; got_body {
-			response_send_got_body(r, false)
-		} else {
-			body(&conn.loop.req, Max_Post_Handler_Discard_Bytes, r, check_body)
-		}
-
-	} else {
+	// RFC 9112 9.3: A server MUST read the entire request message body or close the connection
+	// after sending its response, since otherwise the remaining data on a persistent connection
+	// would be misinterpreted as the next request.
+	switch {
+	case response_must_close(req, r):
 		response_send_got_body(r, true)
+
+	case req._body_ok != nil || req._framing == .None:
+		// Body has been read during handling, or there is none.
+		response_send_got_body(r, false)
+
+	case req._expect_continue:
+		// The client is waiting for a 100 Continue before sending the body, which it now won't
+		// get. It may or may not send the body anyway, so the connection can't be reused.
+		headers_set_close(&r.headers)
+		response_send_got_body(r, true)
+
+	case:
+		// Drain a reasonably sized unread body so the connection can be reused, close otherwise.
+		body(req, Max_Post_Handler_Discard_Bytes, r, check_body)
 	}
 }
 
@@ -334,6 +344,12 @@ response_send_got_body :: proc(r: ^Response, will_close: bool) {
 	}
 
 	buf := bytes.buffer_to_bytes(&r._buf)
+
+	// RFC 9110 9.3.2: The server SHOULD send the same header fields in response to a HEAD request
+	// as it would have sent if the request method had been GET, but MUST NOT send content.
+	if conn.loop.req.is_head {
+		buf = buf[:r._heading_len]
+	}
 	nbio.send_poly(conn.socket, {buf}, conn, on_response_sent)
 }
 
@@ -397,12 +413,19 @@ response_needs_content_length :: proc(r: ^Response, conn: ^Connection) -> bool {
 @(private)
 response_must_close :: proc(req: ^Request, res: ^Response) -> bool {
 	// If the request we are responding to indicates it is closing the connection, close our side too.
-	if req, req_has := headers_get_unsafe(req.headers, "connection"); req_has && req == "close" {
+	if v, has := headers_get_unsafe(req.headers, "connection"); has && header_list_has_token(v, "close") {
+		headers_set_close(&res.headers)
 		return true
 	}
 
 	// If we are responding with a close connection header, make sure we close.
-	if res, res_has := headers_get_unsafe(res.headers, "connection"); res_has && res == "close" {
+	if v, has := headers_get_unsafe(res.headers, "connection"); has && header_list_has_token(v, "close") {
+		return true
+	}
+
+	// The request framing was suspicious or invalid.
+	if req._close_after {
+		headers_set_close(&res.headers)
 		return true
 	}
 
@@ -418,9 +441,10 @@ response_must_close :: proc(req: ^Request, res: ^Response) -> bool {
 		return true
 	}
 
-	// HTTP 1.0 does not have persistent connections.
+	// HTTP 1.0 does not have persistent connections (we don't implement the keep-alive extension).
 	line := req.line.?
 	if line.version == {1, 0} {
+		headers_set_close(&res.headers)
 		return true
 	}
 

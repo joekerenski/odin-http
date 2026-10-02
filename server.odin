@@ -33,10 +33,17 @@ Server_Opts :: struct {
 	// support, at a minimum, request-line lengths of 8000 octets.
 	// defaults to 8000.
 	limit_request_line:      int,
-	// Limit the length of the headers.
+	// Limit the total size of the header section (and, separately, of the trailer section), in bytes,
+	// including line endings.
 	// The HTTP spec does not specify any limits but in practice it is safer.
 	// defaults to 8000.
 	limit_headers:           int,
+	// Limit the number of header (and trailer) field lines, defaults to 100.
+	limit_header_count:      int,
+	// The maximum request body size the server will read, in bytes. A handler can ask for less
+	// with the `max_length` argument of `body`, but never for more.
+	// Bodies over the limit get a 413 and the connection is closed. Defaults to 8MiB.
+	max_body_size:           int,
 	// The thread count to use, defaults to your core count - 1.
 	thread_count:            int,
 
@@ -55,6 +62,8 @@ Default_Server_Opts := Server_Opts {
 	redirect_head_to_get    = true,
 	limit_request_line      = 8000,
 	limit_headers           = 8000,
+	limit_header_count      = 100,
+	max_body_size           = 8 * mem.Megabyte,
 	// initial_temp_block_cap  = 256 * mem.Kilobyte,
 	// max_free_blocks_queued  = 64,
 }
@@ -122,6 +131,11 @@ listen :: proc(
 	opts: Server_Opts = Default_Server_Opts,
 ) -> (err: net.Network_Error) {
 	s.opts = opts
+	// Zero values mean "use the default", so a partially filled `Server_Opts{...}` stays safe.
+	if s.opts.limit_request_line <= 0 { s.opts.limit_request_line = Default_Server_Opts.limit_request_line }
+	if s.opts.limit_headers      <= 0 { s.opts.limit_headers      = Default_Server_Opts.limit_headers }
+	if s.opts.limit_header_count <= 0 { s.opts.limit_header_count = Default_Server_Opts.limit_header_count }
+	if s.opts.max_body_size      <= 0 { s.opts.max_body_size      = Default_Server_Opts.max_body_size }
 	s.conn_allocator = context.allocator
 	// initial_block_cap = int(s.opts.initial_temp_block_cap)
 	// max_free_blocks_queued = int(s.opts.max_free_blocks_queued)
@@ -371,9 +385,11 @@ Connection :: struct {
 // Loop/request cycle state.
 @(private)
 Loop :: struct {
-	conn: ^Connection,
-	req:  Request,
-	res:  Response,
+	conn:              ^Connection,
+	req:               Request,
+	res:               Response,
+	header_bytes_left: int,
+	header_count:      int,
 }
 
 @(private)
@@ -459,6 +475,14 @@ conn_handle_reqs :: proc(c: ^Connection) {
 
 @(private)
 conn_handle_req :: proc(c: ^Connection, allocator := context.temp_allocator) {
+	// Rejects the request with the given status and closes the connection after responding.
+	reject :: proc(l: ^Loop, status: Status) {
+		headers_set_close(&l.res.headers)
+		l.req._close_after = true
+		l.res.status = status
+		respond(&l.res)
+	}
+
 	on_rline1 :: proc(loop: rawptr, token: string, err: bufio.Scanner_Error) {
 		l := cast(^Loop)loop
 
@@ -492,38 +516,49 @@ conn_handle_req :: proc(c: ^Connection, allocator := context.temp_allocator) {
 
 		if err != nil {
 			log.warnf("request scanning error: %v", err)
+			if err == .Too_Long {
+				// We can't know the version of a request we couldn't read, so answer as 1.1.
+				l.req.line = Requestline{version = {1, 1}}
+				reject(l, .URI_Too_Long)
+				return
+			}
 			clean_request_loop(l.conn, close = true)
 			return
 		}
 
-		rline, err := requestline_parse(token, context.temp_allocator)
-		switch err {
-		case .Method_Not_Implemented:
-			log.infof("request-line %q invalid method", token)
-			headers_set_close(&l.res.headers)
-			l.res.status = .Not_Implemented
-			respond(&l.res)
-			return
-		case .Invalid_Version_Format, .Not_Enough_Fields:
-			log.warnf("request-line %q invalid: %s", token, err)
-			clean_request_loop(l.conn, close = true)
-			return
+		rline, rerr := requestline_parse(token, context.temp_allocator)
+		switch rerr {
 		case .None:
 			l.req.line = rline
+		case .Method_Not_Implemented:
+			log.infof("request-line %q invalid method", token)
+			l.req.line = Requestline{version = {1, 1}}
+			reject(l, .Not_Implemented)
+			return
+		case .Invalid_Version_Format, .Not_Enough_Fields, .Invalid_Method, .Invalid_Target:
+			log.infof("request-line %q invalid: %s", token, rerr)
+			l.req.line = Requestline{version = {1, 1}}
+			reject(l, .Bad_Request)
+			return
 		}
 
-		// Might need to support more versions later.
-		if rline.version.major != 1 || rline.version.minor > 1 {
+		// RFC 9112 2.3: a 1.x message with a higher minor version is processed as the highest
+		// minor version we support. Other major versions are not supported.
+		if rline.version.major != 1 {
 			log.infof("request http version not supported %v", rline.version)
-			headers_set_close(&l.res.headers)
-			l.res.status = .HTTP_Version_Not_Supported
-			respond(&l.res)
+			l.req.line = Requestline{version = {1, 1}}
+			reject(l, .HTTP_Version_Not_Supported)
 			return
+		}
+		if rline.version.minor > 1 {
+			(&l.req.line.(Requestline)).version.minor = 1
 		}
 
 		l.req.url = url_parse(rline.target.(string))
 
-		l.conn.scanner.max_token_size = l.conn.server.opts.limit_headers
+		l.header_bytes_left = l.conn.server.opts.limit_headers
+		l.header_count      = 0
+		l.conn.scanner.max_token_size = l.header_bytes_left
 		scanner_scan(&l.conn.scanner, loop, on_header_line)
 	}
 
@@ -532,6 +567,10 @@ conn_handle_req :: proc(c: ^Connection, allocator := context.temp_allocator) {
 
 		if err != nil {
 			log.warnf("request scanning error: %v", err)
+			if err == .Too_Long {
+				reject(l, .Request_Header_Fields_Too_Large)
+				return
+			}
 			clean_request_loop(l.conn, close = true)
 			return
 		}
@@ -542,48 +581,35 @@ conn_handle_req :: proc(c: ^Connection, allocator := context.temp_allocator) {
 			return
 		}
 
-		if _, ok := header_parse(&l.req.headers, token); !ok {
-			log.warnf("header-line %s is invalid", token)
-			headers_set_close(&l.res.headers)
-			l.res.status = .Bad_Request
-			respond(&l.res)
-			return
-		}
-
-		l.conn.scanner.max_token_size -= len(token)
-		if l.conn.scanner.max_token_size <= 0 {
+		// Account for the line ending too, so the limit is on bytes received.
+		l.header_bytes_left -= len(token) + 2
+		l.header_count      += 1
+		if l.header_bytes_left < 0 || l.header_count > l.conn.server.opts.limit_header_count {
 			log.warn("request headers too large")
-			headers_set_close(&l.res.headers)
-			l.res.status = .Request_Header_Fields_Too_Large
-			respond(&l.res)
+			reject(l, .Request_Header_Fields_Too_Large)
 			return
 		}
 
+		if _, ok := header_parse(&l.req.headers, token); !ok {
+			log.infof("header-line %q is invalid", token)
+			reject(l, .Bad_Request)
+			return
+		}
+
+		l.conn.scanner.max_token_size = max(l.header_bytes_left, 1)
 		scanner_scan(&l.conn.scanner, loop, on_header_line)
 	}
 
 	on_headers_end :: proc(l: ^Loop) {
-		if !headers_validate_for_server(&l.req.headers) {
-			log.warn("request headers are invalid")
-			headers_set_close(&l.res.headers)
-			l.res.status = .Bad_Request
-			respond(&l.res)
+		if status, ok := request_prepare(&l.req, l.conn.server.opts); !ok {
+			log.infof("request rejected: %v", status)
+			reject(l, status)
 			return
 		}
 
 		l.req.headers.readonly = true
 
 		l.conn.scanner.max_token_size = bufio.DEFAULT_MAX_SCAN_TOKEN_SIZE
-
-		// Automatically respond with a continue status when the client has the Expect: 100-continue header.
-		if expect, ok := headers_get_unsafe(l.req.headers, "expect");
-		   ok && expect == "100-continue" && l.conn.server.opts.auto_expect_continue {
-
-			l.res.status = .Continue
-
-			respond(&l.res)
-			return
-		}
 
 		rline := &l.req.line.(Requestline)
 		// An options request with the "*" is a no-op/ping request to
@@ -595,9 +621,8 @@ conn_handle_req :: proc(c: ^Connection, allocator := context.temp_allocator) {
 			// Give the handler this request as a GET, since the HTTP spec
 			// says a HEAD is identical to a GET but just without writing the body,
 			// handlers shouldn't have to worry about it.
-			is_head := rline.method == .Head
-			if is_head && l.conn.server.opts.redirect_head_to_get {
-				l.req.is_head = true
+			l.req.is_head = rline.method == .Head
+			if l.req.is_head && l.conn.server.opts.redirect_head_to_get {
 				rline.method = .Get
 			}
 
