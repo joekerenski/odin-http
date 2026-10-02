@@ -3,8 +3,10 @@ package tests_server
 import "core:bytes"
 import "core:encoding/endian"
 import "core:fmt"
+import "core:math/rand"
 import "core:net"
 import "core:strings"
+import "core:sync"
 import "core:testing"
 import "core:time"
 
@@ -306,4 +308,113 @@ ws_keepalive_ping :: proc(t: ^testing.T) {
 	// Don't answer: the server gives up on us.
 	_, closed := raw_recv({c.sock}, 2 * time.Second)
 	testing.expect(t, closed, "dead peer not dropped")
+}
+
+@(private="file")
+cross_handle: ws.Handle
+@(private="file")
+cross_ready: sync.Sema
+
+@(test)
+ws_send_from_other_thread :: proc(t: ^testing.T) {
+	h := http.handler(proc(req: ^http.Request, res: ^http.Response) {
+		ws.upgrade(req, res, {}, {
+			on_open = proc(c: ^ws.Conn) {
+				cross_handle = ws.handle(c)
+				sync.sema_post(&cross_ready)
+			},
+		})
+	})
+	ts := server_start(t, h)
+	defer server_stop(ts)
+
+	c, _, ok := ws_dial(t, ts)
+	testing.expect(t, ok)
+	defer net.close(c.sock)
+	sync.sema_wait(&cross_ready)
+
+	// From the test thread (not the server's event loop).
+	ws.broadcast({cross_handle, cross_handle}, .Text, transmute([]byte)string("from afar"))
+	for _ in 0 ..< 2 {
+		f, fok := ws_recv(&c)
+		testing.expectf(t, fok && string(f.payload) == "from afar", "got %v", f)
+	}
+
+	ws.close_from_any_thread(cross_handle, .Going_Away)
+	f, fok := ws_recv(&c)
+	testing.expectf(t, fok && f.opcode == .Close, "got %v", f)
+	ws_send(&c, .Close, close_payload(1001))
+	_, closed := raw_recv({c.sock}, 2 * time.Second)
+	testing.expect(t, closed)
+
+	// The connection is gone: sending to its handle is a no-op.
+	ws.send_from_any_thread(cross_handle, .Text, transmute([]byte)string("nobody home"))
+}
+
+WS_FUZZ_ITERATIONS :: #config(WS_FUZZ_ITERATIONS, 600)
+
+// Random/mutated frame sequences against the echo server: every exchange must end with the server
+// closing the connection (no hangs, no crashes) after the client stops, and the server must stay healthy.
+@(test)
+ws_fuzz_frames :: proc(t: ^testing.T) {
+	ts := server_start(t, ws_echo_handler(), fast_opts())
+	defer server_stop(ts)
+
+	r := rand.create(rand.uint64())
+	context.random_generator = rand.default_random_generator(&r)
+
+	opcodes := []u8{0x0, 0x1, 0x2, 0x3, 0x8, 0x9, 0xA, 0xB, 0xF}
+	for _ in 0 ..< WS_FUZZ_ITERATIONS {
+		c, head, ok := ws_dial(t, ts)
+		if !ok || status_of(head) != 101 {
+			testing.expectf(t, false, "handshake failed: %q", head)
+			net.close(c.sock)
+			continue
+		}
+
+		stream := make([dynamic]byte, context.temp_allocator)
+		for _ in 0 ..< 1 + rand.int_max(6) {
+			payload := make([]byte, rand.choice([]int{0, 1, 2, 5, 125, 126, 200, 3000}), context.temp_allocator)
+			for &b in payload { b = byte(rand.int_max(256)) if rand.int_max(2) == 0 else 'a' }
+			op := rand.choice(opcodes)
+			fin := rand.int_max(4) != 0
+			masked := rand.int_max(10) != 0
+			hdr: [ws.MAX_HEADER_SIZE]byte
+			mask := [4]byte{byte(rand.int_max(256)), 1, 2, 3}
+			h := ws.write_header(hdr[:], fin, ws.Opcode(op & 0xF) if op <= 2 || (op >= 8 && op <= 0xA) else .Text, len(payload), mask if masked else nil)
+			h[0] = (h[0] & 0xF0) | (op & 0x0F)
+			if rand.int_max(10) == 0 { h[0] |= byte(rand.int_max(8)) << 4 }
+			if masked { ws.apply_mask(payload, mask) }
+			append(&stream, ..h)
+			append(&stream, ..payload)
+		}
+		// Byte-level mutations on top.
+		for _ in 0 ..< rand.int_max(3) {
+			if len(stream) > 0 { stream[rand.int_max(len(stream))] = byte(rand.int_max(256)) }
+		}
+		if rand.int_max(4) == 0 { resize(&stream, rand.int_max(len(stream) + 1)) }
+
+		raw_send({c.sock}, string(stream[:]))
+		// Then a clean close from our side; the server must close TCP within the close timeout.
+		ws_send(&c, .Close, close_payload(1000))
+		net.shutdown(c.sock, .Send)
+		deadline := time.tick_now()
+		closed := false
+		for time.tick_since(deadline) < 8 * time.Second {
+			if !ws_fill(&c, 2 * time.Second) {
+				_, closed = raw_recv({c.sock}, 10 * time.Millisecond)
+				break
+			}
+		}
+		testing.expectf(t, closed, "server did not close after stream % x", stream[:min(len(stream), 64)])
+		net.close(c.sock)
+		free_all(context.temp_allocator)
+	}
+
+	c, head, ok := ws_dial(t, ts)
+	defer net.close(c.sock)
+	testing.expectf(t, ok && status_of(head) == 101, "unhealthy after fuzzing: %q", head)
+	ws_send(&c, .Text, transmute([]byte)string("still alive"))
+	f, fok := ws_recv(&c)
+	testing.expectf(t, fok && string(f.payload) == "still alive", "got %v", f)
 }

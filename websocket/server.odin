@@ -91,6 +91,8 @@ Conn :: struct {
 	subprotocol:   string,
 	state:         State,
 
+	_id:           u64,
+	_loop:         ^nbio.Event_Loop,
 	_cb:           Callbacks,
 	_opts:         Opts,
 	_h:            http.Hijacked,
@@ -284,6 +286,7 @@ on_hijacked :: proc(user: rawptr, h: http.Hijacked, buffered: []byte, ok: bool) 
 
 	c._h = h
 	c.state = .Open
+	register(c)
 	c._write_timeout = http.hijacked_server_opts(h).write_timeout
 	append(&c._rbuf, ..buffered)
 
@@ -652,6 +655,7 @@ maybe_finalize :: proc(c: ^Conn) {
 	if !c._aborting || c._recv_pending || c._send_pending || c._finalized { return }
 	c._finalized = true
 	c.state = .Closed
+	unregister(c)
 
 	if c._close_timer != nil {
 		nbio.remove(c._close_timer)
