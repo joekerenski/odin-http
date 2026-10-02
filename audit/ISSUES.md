@@ -110,8 +110,10 @@ This file is the working checklist. Finding IDs (S/F/C) refer to [REPORT.md](REP
 
 ## Phase 6: Performance
 
-- [ ] **P1** Benchmark harness (`wrk`/`oha` or a small Odin load generator): plaintext, JSON, 1 KB / 64 KB / 1 MB bodies, pipelined, many idle connections. Record a baseline against upstream `fac113f` before changing hot paths.
+- [x] **P1** Benchmark harness (bench/: server + oha scripts; baseline recorded) (`wrk`/`oha` or a small Odin load generator): plaintext, JSON, 1 KB / 64 KB / 1 MB bodies, pipelined, many idle connections. Record a baseline against upstream `fac113f` before changing hot paths.
 - [ ] **P2** Connection pooling (scanner buffer + arena reuse, the existing TODO), avoid per-header allocations in `sanitize_key`, write responses directly from a fixed buffer (existing TODO).
 - [ ] **P3** Zero-copy bodies where possible (Content-Length bodies sliced from the scanner buffer), vectored sends (heading + body).
 - [ ] **P4** Static files via `sendfile`, `Range` support, conditional requests.
 - [ ] **P5** Track p50/p99 latency and RSS in CI-adjacent benchmark runs; no hardening change may regress throughput by more than 5% without a note here.
+- [ ] **P6** Regression on new connections: no-keepalive throughput is ~33k req/s vs upstream's ~52k. Not caused by timeouts or TCP_NODELAY (A/B tested). Bisect: 528aeb5 is still ~53k, so it came in a later commit (984d62c..fd99904).
+- [ ] **P7** Per-op timeouts cost ~3-13% on small keep-alive requests (io_uring linked timeouts). Plan: a per-thread sweeper with coarse (1s) deadlines instead of per-op timeouts.

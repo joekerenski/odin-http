@@ -107,3 +107,9 @@ Our deployment terminates TLS/HTTP2/HTTP3 in Caddy and proxies HTTP/1.1 to the O
     - File handles are closed on every error path (Linux).
   - **Fuzzing:** the cookie iterator and cookie date parser survived 3M fuzz inputs.
 - Response status can be patched after the body is written (fixed-width status, no reason phrase).
+
+## Upstream (Odin core) issues found along the way
+
+| ID | Finding | Workaround |
+|---|---|---|
+| U1 | `core:nbio` `sendfile` on Linux (dev-2026-09) never closes the read end of its splice pipe on success (`sendfile_callback`, impl_linux.odin): one fd leaked per call. After ~8k static file responses the process held 8k pipes, and a server thread spun at 100% after SIGINT. | Files are streamed with bounded `read` + `send` instead (response.odin). Faster than upstream's whole-file buffering anyway. |

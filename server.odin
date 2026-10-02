@@ -585,6 +585,10 @@ on_accept :: proc(op: ^nbio.Operation, server: ^Server) {
 	// Accept next connection.
 	server_accept(td)
 
+	// Responses are written in as few sends as possible already; without this, a heading and body
+	// sent separately (files, 100-continue) hit Nagle + delayed ACK stalls of ~40ms.
+	net.set_option(op.accept.client, .TCP_Nodelay, true)
+
 	c := new(Connection, server.conn_allocator)
 	c.state = .New
 	c.server = server

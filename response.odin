@@ -4,8 +4,8 @@ import "core:bytes"
 import "core:io"
 import "core:log"
 import "core:mem"
-import "core:nbio"
 import "core:mem/virtual"
+import "core:nbio"
 import "core:slice"
 import "core:strconv"
 
@@ -39,12 +39,16 @@ Response_File :: struct {
 	handle: nbio.Handle,
 	offset: int,
 	length: int,
+	buf:    []byte,
 }
 
-// Files are sent in chunks of this size, so `write_timeout` applies per chunk (progress) rather
-// than to the whole file.
+// Files are streamed through a buffer of this size (read a chunk, send it, repeat), so memory use
+// is bounded and `write_timeout` applies per chunk rather than to the whole file.
+//
+// NOTE: not `nbio.sendfile`: on Linux (dev-2026-09) it leaks the pipe it splices through on every
+// successful call, see audit/REPORT.md (U1).
 @(private)
-SENDFILE_CHUNK :: 4 * mem.Megabyte
+FILE_CHUNK :: 256 * mem.Kilobyte
 
 response_init :: proc(r: ^Response, allocator := context.allocator) {
 	r.status             = .Not_Found
@@ -413,21 +417,32 @@ response_send_got_body :: proc(r: ^Response, will_close: bool) {
 @(private)
 response_file_send_next :: proc(conn: ^Connection) {
 	file := &conn.loop.res._file.?
-	n := min(file.length, SENDFILE_CHUNK)
-	timeout := conn.server.opts.write_timeout if conn.server.opts.write_timeout > 0 else nbio.NO_TIMEOUT
-	nbio.sendfile_poly(conn.socket, file.handle, conn, on_sent, offset = file.offset, nbytes = n, timeout = timeout)
+	if file.buf == nil {
+		file.buf = make([]byte, min(file.length, FILE_CHUNK), virtual.arena_allocator(&conn.temp_allocator))
+	}
+	n := min(file.length, len(file.buf))
+	nbio.read_poly(file.handle, file.offset, file.buf[:n], conn, on_read, all = true)
 
-	on_sent :: proc(op: ^nbio.Operation, conn: ^Connection) {
-		if op.sendfile.err != nil {
-			log.infof("sendfile on connection %i failed: %v", conn.socket, op.sendfile.err)
+	on_read :: proc(op: ^nbio.Operation, conn: ^Connection) {
+		file := &conn.loop.res._file.?
+		if op.read.err != nil || op.read.read == 0 {
+			// Includes the file shrinking since we stat'ed it: the promised length can't be sent.
+			log.infof("reading file for connection %i failed: %v (read %i)", conn.socket, op.read.err, op.read.read)
 			response_file_done(conn, false)
 			return
 		}
 
-		file := &conn.loop.res._file.?
-		file.offset += op.sendfile.sent
-		file.length -= op.sendfile.sent
-		if file.length > 0 {
+		file.offset += op.read.read
+		file.length -= op.read.read
+		connection_send(conn, file.buf[:op.read.read], on_sent)
+	}
+
+	on_sent :: proc(conn: ^Connection, ok: bool) {
+		if !ok {
+			response_file_done(conn, false)
+			return
+		}
+		if conn.loop.res._file.?.length > 0 {
 			response_file_send_next(conn)
 			return
 		}
