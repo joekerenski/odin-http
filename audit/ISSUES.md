@@ -9,10 +9,10 @@ This file is the working checklist. Finding IDs (S/F/C) refer to [REPORT.md](REP
 
 ## Phase 0: Test infrastructure
 
-- [ ] **T1** `tests/server`: black-box harness that starts a real server on an ephemeral port and talks raw bytes (started; 16 cases).
+- [x] **T1** `tests/server`: black-box harness that starts a real server on an ephemeral port and talks raw bytes. (528aeb5)
 - [ ] **T2** Unit tests for every parser: request line, version, header line, Content-Length, chunk size, Transfer-Encoding list, Connection list, cookies, dates, URL / percent-decoding, MIME lookup.
-- [ ] **T3** Fuzz drivers for the parsers (random + mutational from a seed corpus) with invariants: no panic, bounded allocation, round-trip where applicable. Run in CI for a fixed time budget.
-- [ ] **T4** Pipelining / keep-alive tests: N requests on one connection with mixed bodies, verify exact response framing.
+- [x] **T3** Fuzz drivers for the parsers (random + mutational from a seed corpus) with invariants: no panic, bounded allocation, round-trip where applicable. Run in CI for a fixed time budget. (this commit)
+- [x] **T4** Pipelining / keep-alive tests: N requests on one connection with mixed bodies, verify exact response framing. (984d62c)
 - [ ] **T5** Concurrency tests: many connections across threads, shutdown under load, no leaks (tracking allocator) and clean ASan.
 - [ ] **T6** Client test harness: crafted-response server (status, framing, TLS with a local CA, truncation, slow responses).
 - [ ] **T7** Interop: real curl / Python clients against the server; real servers against the client; Caddy in front of the server (docker) for the pooled-connection cases.
@@ -20,34 +20,34 @@ This file is the working checklist. Finding IDs (S/F/C) refer to [REPORT.md](REP
 
 ## Phase 1: Server crashes and framing (critical / high)
 
-- [ ] **S1** Trailers: parse into a separate `req.trailers` map with its own size limit (S13); never touch read-only headers.
-- [ ] **S2** Chunk terminator: a missing CRLF after chunk data is a framing error → 400 + close, never an assert.
-- [ ] **S3, S10** Strict `1*DIGIT` Content-Length parser with overflow check, validated at header time (not lazily in `body`). Same strictness for hex chunk sizes (no sign, prefix, `_`, overflow).
-- [ ] **S4** HEAD: send heading only, keep Content-Length of the would-be body; don't read files for HEAD.
-- [ ] **S6, S22** `Expect: 100-continue`: send `100 Continue` as an interim response *only when the handler starts reading the body*, then continue with the same request. Case-insensitive; ignore for HTTP/1.0.
-- [ ] **S8** Transfer-Encoding: parse as a case-insensitive coding list; last coding must be exactly `chunked`; `chunked` only once; unknown codings → 501 + close.
-- [ ] **S9** TE + CL present → process as chunked, drop CL, force `Connection: close` after the response.
-- [ ] **S11** Header names must be RFC 9110 `token`; values must be `field-content` (no NUL, CR, LF, other CTLs except HTAB). Trim only SP/HTAB.
-- [ ] **S12** Request line: exact `method SP request-target SP HTTP/DIGIT.DIGIT`; target must be non-empty, without CTL/SP/DEL; method a valid token (unknown → 501).
-- [ ] **S16** `Connection` parsed as a case-insensitive token list.
-- [ ] **S21** Header limit counts raw bytes incl. CRLF; cap header count; duplicate header combining in linear time.
+- [x] **S1** Trailers: parse into a separate `req.trailers` map with its own size limit (S13); never touch read-only headers. (528aeb5)
+- [x] **S2** Chunk terminator: a missing CRLF after chunk data is a framing error → 400 + close, never an assert. (528aeb5)
+- [x] **S3, S10** Strict `1*DIGIT` Content-Length parser with overflow check, validated at header time (not lazily in `body`). Same strictness for hex chunk sizes (no sign, prefix, `_`, overflow). (528aeb5)
+- [x] **S4** HEAD: send heading only, keep Content-Length of the would-be body; don't read files for HEAD. (528aeb5)
+- [x] **S6, S22** `Expect: 100-continue`: send `100 Continue` as an interim response *only when the handler starts reading the body*, then continue with the same request. Case-insensitive; ignore for HTTP/1.0. (528aeb5)
+- [x] **S8** Transfer-Encoding: parse as a case-insensitive coding list; last coding must be exactly `chunked`; `chunked` only once; unknown codings → 501 + close. (528aeb5)
+- [x] **S9** TE + CL present → process as chunked, drop CL, force `Connection: close` after the response. (528aeb5)
+- [x] **S11** Header names must be RFC 9110 `token`; values must be `field-content` (no NUL, CR, LF, other CTLs except HTAB). Trim only SP/HTAB. (528aeb5)
+- [x] **S12** Request line: exact `method SP request-target SP HTTP/DIGIT.DIGIT`; target must be non-empty, without CTL/SP/DEL; method a valid token (unknown → 501). (528aeb5)
+- [x] **S16** `Connection` parsed as a case-insensitive token list. (528aeb5)
+- [x] **S21** Header limit counts raw bytes incl. CRLF; cap header count; duplicate header combining in linear time. (528aeb5 / 984d62c)
 
 ## Phase 2: Timeouts, limits, robustness
 
-- [ ] **S5** Timeouts in `Server_Opts`, all enforced with nbio per-op timeouts:
+- [x] **S5** Timeouts in `Server_Opts`, all enforced with nbio per-op timeouts: (43d65f5)
   - `header_timeout`: whole request head.
   - `body_read_timeout`: per read.
   - `idle_timeout`: keep-alive wait for the next request.
   - `write_timeout`.
 
   Sensible non-zero defaults.
-- [ ] **S7** `max_body_size` in `Server_Opts` with a finite default (e.g. 8 MiB); per-call `max_length` can lower it, not raise it beyond the server cap unless explicitly allowed.
-- [ ] **S14** Accept errors: retry transient ones (`Aborted`, `Interrupted`, `Would_Block`), back off on resource exhaustion, log and keep running otherwise. Never panic on network input.
-- [ ] **S15** Response headers and cookies: reject (assert in debug, drop + log in release) names that aren't tokens and values containing CR/LF/NUL/CTLs. No silent "escaping".
-- [ ] **S17** Signal handling: async-signal-safe (set an atomic flag + wake the loops), no thread-local access.
-- [ ] **S18** Per-thread cached Date (each loop updates its own once per second).
-- [ ] **S19** Shutdown: no busy loop; optional deadline after which active connections are force-closed.
-- [ ] **S20** `max_connections` per server; accept pauses at the cap and resumes on close.
+- [x] **S7** `max_body_size` in `Server_Opts` with a finite default (e.g. 8 MiB); per-call `max_length` can lower it, not raise it beyond the server cap unless explicitly allowed. (528aeb5)
+- [x] **S14** Accept errors: retry transient ones (`Aborted`, `Interrupted`, `Would_Block`), back off on resource exhaustion, log and keep running otherwise. Never panic on network input. (43d65f5)
+- [x] **S15** Response headers and cookies: reject (assert in debug, drop + log in release) names that aren't tokens and values containing CR/LF/NUL/CTLs. No silent "escaping". (43d65f5)
+- [x] **S17** Signal handling: async-signal-safe (set an atomic flag + wake the loops), no thread-local access. (43d65f5)
+- [x] **S18** Per-thread cached Date (each loop updates its own once per second). (43d65f5)
+- [x] **S19** Shutdown: no busy loop; optional deadline after which active connections are force-closed. (43d65f5)
+- [x] **S20** `max_connections` per server; accept pauses at the cap and resumes on close. (43d65f5)
 - [ ] **A1** Replace remaining `assert`s on input-dependent paths with errors. Audit every `#no_bounds_check`.
 
 ## Phase 3: Static files, routing, cookies

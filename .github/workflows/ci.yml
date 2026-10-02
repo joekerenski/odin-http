@@ -34,6 +34,10 @@ jobs:
         if: success() || failure()
         run: odin test tests/unit -vet --strict-style
         timeout-minutes: 5
+      - name: Parser fuzzing
+        if: success() || failure()
+        run: odin test tests/fuzz -o:speed -define:FUZZ_ITERATIONS=2000000
+        timeout-minutes: 10
       - name: Server tests
         if: success() || failure()
         run: odin test tests/server -vet --strict-style

@@ -167,12 +167,13 @@ header_parse :: proc(headers: ^Headers, line: string, allocator := context.temp_
 		if headers_has_unsafe(headers^, "host") { return }
 
 	case "content-length":
-		// RFC 9112 6.3: differing Content-Length values make the framing invalid. Identical
-		// duplicates are tolerated and collapsed into one, so the stored value stays a single number.
+		// RFC 9112 6.3: an invalid Content-Length, or differing values, make the framing invalid.
+		// Identical duplicates are tolerated and collapsed into one, so the stored value is always
+		// a single valid number.
+		b := parse_content_length(value) or_return
 		if cl, has_cl := headers_get_unsafe(headers^, "content-length"); has_cl {
-			a, aok := parse_content_length(cl)
-			b, bok := parse_content_length(value)
-			(aok && bok && a == b) or_return
+			a, _ := parse_content_length(cl)
+			(a == b) or_return
 			delete(tmp_key, allocator)
 			return "content-length", true
 		}
