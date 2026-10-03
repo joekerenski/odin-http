@@ -85,7 +85,13 @@ This file is the working checklist. Finding IDs (S/F/C) refer to [REPORT.md](REP
 - [x] **W3** Message assembly: fragmentation, interleaved control frames, incremental UTF-8 validation for text (fail fast), `max_message_size` and `max_frame_size`. (2ca5a6f)
 - [x] **W4** Close handshake: status code validation, close-reason UTF-8, timeouts for the peer's close, TCP close ordering. (2ca5a6f)
 - [x] **W5** Ping/pong: auto-pong, optional keepalive pings with a dead-peer timeout; idle timeout. (2ca5a6f)
-- [ ] **W6** Send path: bounded per-connection send queue with backpressure signal (`send` returns a full/queued status), zero-copy writes where possible, broadcast helper across threads (`nbio.exec` onto the owning loop).
+- [x] **W6** Send path: bounded per-connection send queue with backpressure signal (`send` returns a full/queued status), zero-copy writes where possible, broadcast helper across threads (`nbio.exec` onto the owning loop).
+  - `bench/ws` / `bench/ws.sh` (Linux container, one server thread, one load thread). Changes, 2026-10-03:
+    - Queued frames go out in one vectored send (up to 64): echo-32 491k -> 1.87M msg/s (p50 2.1 -> 0.56ms), echo-4k 405k -> 650k msg/s.
+    - Keepalive: one timer per connection instead of a timeout on every read (that cost ~5.5% on echo-4k).
+    - `broadcast`: one mailbox entry and one copy per event loop, and one shared encoded frame for the uncompressed server connections on it (~30% less server CPU per message for 4KiB to 1000 subscribers). Fixes silent drops: a busy loop dropped everything past `MAILBOX_LIMIT` counted per handle (655/1000 of a 100KiB broadcast; `ws_broadcast_large_fanout`).
+    - Compression defaults to zlib level 1 (echoz-4k 70k -> 110k msg/s vs level 6).
+  - Not done: a per-connection frame allocation (and copy) remains for every send; zero-copy sends would need an ownership-taking API.
 - [x] **W7** Client side (`websocket.dial`) over the hardened client, with masking from a CSPRNG.
   - Built on nbio directly (the HTTP client is blocking and not hardened yet), sharing the connection code with the server (`conn.odin`). `ws://` only: TLS on the event loop is out of scope. Masks from `crypto.rand_bytes` in batches; the client waits for the server to close TCP after the close handshake (RFC 6455 7.1.1). Tests: `ws_client_echo` (quarantine allocator), `ws_client_handshake_failures`, compressed client sessions in `stress_websocket`.
 - [x] **W8** Autobahn TestSuite (fuzzingclient against our server, fuzzingserver against our client) in docker: 100% pass on cases 1-11 (non-compression), informational cases reviewed.

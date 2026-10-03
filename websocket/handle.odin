@@ -4,6 +4,7 @@ import "base:runtime"
 
 import "core:mem"
 import "core:nbio"
+import "core:slice"
 import "core:sync"
 
 /*
@@ -37,10 +38,25 @@ close_from_any_thread :: proc(h: Handle, code: Close_Code = .Normal) {
 	post(h, Mail{id = h.id, close = true, code = code})
 }
 
-// Sends `data` to every handle, see `send_from_any_thread`.
+/*
+Sends `data` to every handle, like `send_from_any_thread` (without results). Cheaper than sending
+one by one: one mailbox entry and one copy of `data` per event loop, and uncompressed server
+connections on a loop share a single encoded frame.
+*/
 broadcast :: proc(handles: []Handle, kind: Message_Kind, data: []byte) {
-	for h in handles {
-		send_from_any_thread(h, kind, data)
+	if len(handles) == 0 { return }
+	sorted := make([]Handle, len(handles), context.temp_allocator)
+	copy(sorted, handles)
+	slice.sort_by(sorted, proc(a, b: Handle) -> bool { return uintptr(a.loop) < uintptr(b.loop) })
+
+	allocator := runtime.heap_allocator()
+	for i := 0; i < len(sorted); {
+		j := i
+		for j < len(sorted) && sorted[j].loop == sorted[i].loop { j += 1 }
+		ids := make([]u64, j - i, allocator)
+		for h, k in sorted[i:j] { ids[k] = h.id }
+		post(sorted[i], Mail{ids = ids, kind = kind, data = data})
+		i = j
 	}
 }
 
@@ -66,6 +82,8 @@ Mailbox :: struct {
 
 @(private)
 Mail :: struct {
+	// A broadcast to these connections (heap allocated), else a message to `id`.
+	ids:       []u64,
 	id:        u64,
 	close:     bool,
 	code:      Close_Code,
@@ -87,8 +105,10 @@ post :: proc(h: Handle, m: Mail) {
 
 	sync.guard(&mailboxes_mu)
 	mb := mailboxes[h.loop]
-	if mb == nil || !mb.open { return }
-	if mb.bytes + len(m.data) > MAILBOX_LIMIT { return }
+	if mb == nil || !mb.open || mb.bytes + len(m.data) > MAILBOX_LIMIT {
+		delete(m.ids, allocator)
+		return
+	}
 
 	if len(m.data) > 0 {
 		data := make([]byte, len(m.data), allocator)
@@ -124,6 +144,12 @@ drain :: proc(_: ^nbio.Operation, mb: ^Mailbox) {
 	}
 
 	for m in mail {
+		if m.ids != nil {
+			deliver_broadcast(m)
+			delete(m.ids, allocator)
+			delete(m.data, allocator)
+			continue
+		}
 		c, ok := registry[m.id]
 		switch {
 		case m.close:
@@ -139,6 +165,21 @@ drain :: proc(_: ^nbio.Operation, mb: ^Mailbox) {
 
 	// Closed while this drain was queued: nothing refers to the mailbox anymore.
 	if closed { free(mb, allocator) }
+}
+
+@(private)
+deliver_broadcast :: proc(m: Mail) {
+	sf: ^Shared_Frame
+	defer if sf != nil { shared_frame_release(sf) }
+	for id in m.ids {
+		c := registry[id] or_continue
+		if can_share_frames(c) {
+			if sf == nil { sf = shared_frame_make(m.kind, m.data, runtime.heap_allocator()) }
+			queue_shared_frame(c, sf, len(m.data))
+		} else {
+			send(c, m.kind, m.data)
+		}
+	}
 }
 
 // Open connections of the current thread, by id.
@@ -182,7 +223,10 @@ unregister :: proc(c: ^Conn) {
 		if mb == nil { return }
 		mb.open = false
 		if !mb.waking {
-			for m in mb.mail { delete(m.data, allocator) }
+			for m in mb.mail {
+				delete(m.data, allocator)
+				delete(m.ids, allocator)
+			}
 			delete(mb.mail)
 			free(mb, allocator)
 		}

@@ -40,7 +40,8 @@ Opts :: struct {
 	// permessage-deflate (RFC 7692): offered by the client, accepted by the server when the
 	// client offers it. Costs ~300KiB of zlib state per connection.
 	compression:       bool,
-	// zlib level 1 (fastest) .. 9 (smallest), defaults to 6.
+	// zlib level 1 (fastest) .. 9 (smallest), defaults to 1: for live messages speed matters more
+	// than the last few percent of size (level 6 was ~35% slower in bench/ws, echoz-4k).
 	compression_level: int,
 	// Server only. Decides whether a handshake with the given Origin header is accepted. When nil,
 	// requests with an Origin are only accepted if it names the same host as the Host header
@@ -133,12 +134,19 @@ Conn :: struct {
 	_msg_compressed: bool,
 	_utf8:           Utf8_Validator,
 	_recv_pending:   bool,
+
+	// Keepalive: one timer per connection instead of a timeout on every read.
+	_keepalive:      ^nbio.Operation,
+	_last_rx:        time.Time,
+	_ping_sent:      time.Time,
 	_awaiting_pong:  bool,
 
 	// Write side.
 	_queue:         [dynamic]Out_Frame,
 	_queued_bytes:  int,
 	_send_pending:  bool,
+	// Frames at the front of the queue that the pending send covers.
+	_inflight:      int,
 
 	// Close handshake.
 	_close_queued:     bool,
@@ -159,10 +167,73 @@ Conn :: struct {
 @(private)
 Out_Frame :: struct {
 	buf:         []byte,
+	// Set when `buf` is shared with other connections (a broadcast), see `Shared_Frame`.
+	shared:      ^Shared_Frame,
 	sent:        int,
 	payload_len: int,
 	close:       bool,
 	data:        bool,
+}
+
+/*
+An encoded frame queued on several connections of one event loop (a broadcast to uncompressed
+server connections: no mask, so the bytes are the same for all). Freed when the last one sent it.
+Only used on its loop's thread, so the count isn't atomic.
+*/
+@(private)
+Shared_Frame :: struct {
+	refs:      int,
+	buf:       []byte,
+	allocator: mem.Allocator,
+}
+
+@(private)
+shared_frame_make :: proc(kind: Message_Kind, payload: []byte, allocator: mem.Allocator) -> ^Shared_Frame {
+	hdr: [MAX_HEADER_SIZE]byte
+	h := write_header(hdr[:], true, Opcode(kind), len(payload))
+	sf := new(Shared_Frame, allocator)
+	sf.allocator = allocator
+	sf.buf = make([]byte, len(h) + len(payload), allocator)
+	copy(sf.buf, h)
+	copy(sf.buf[len(h):], payload)
+	sf.refs = 1 // The creator's reference, see `shared_frame_release`.
+	return sf
+}
+
+@(private)
+shared_frame_release :: proc(sf: ^Shared_Frame) {
+	sf.refs -= 1
+	if sf.refs == 0 {
+		delete(sf.buf, sf.allocator)
+		free(sf, sf.allocator)
+	}
+}
+
+// Whether a shared frame (see `Shared_Frame`) can be queued on `c` instead of encoding its own.
+@(private)
+can_share_frames :: proc(c: ^Conn) -> bool {
+	return c.role == .Server && !c.compressed
+}
+
+// Queues a shared frame; same rules as `send`.
+@(private)
+queue_shared_frame :: proc(c: ^Conn, sf: ^Shared_Frame, payload_len: int) -> Send_Result {
+	if c.state != .Open || c._aborting { return .Closed }
+	if c._queued_bytes + payload_len > c._opts.send_queue_limit { return .Queue_Full }
+	sf.refs += 1
+	append(&c._queue, Out_Frame{buf = sf.buf, shared = sf, payload_len = payload_len, data = true})
+	c._queued_bytes += payload_len
+	send_next(c)
+	return .Ok
+}
+
+@(private)
+frame_free :: proc(c: ^Conn, f: Out_Frame) {
+	if f.shared != nil {
+		shared_frame_release(f.shared)
+	} else {
+		delete(f.buf, c._allocator)
+	}
 }
 
 // Sends a message. Data is copied, it can be reused right away.
@@ -249,6 +320,11 @@ conn_open :: proc(c: ^Conn, buffered: []byte) {
 	defer leave(c)
 	append(&c._rbuf, ..buffered)
 
+	c._last_rx = nbio.now()
+	if c._opts.ping_interval > 0 {
+		arm_keepalive(c, c._opts.ping_interval)
+	}
+
 	context.temp_allocator = c._temp
 	if c._cb.on_open != nil { c._cb.on_open(c) }
 
@@ -269,13 +345,8 @@ start_recv :: proc(c: ^Conn) {
 		reserve(&c._rbuf, len(c._rbuf) + 16384)
 	}
 
-	timeout: time.Duration
-	switch {
-	case c.state == .Closing:       timeout = c._opts.close_timeout
-	case c._awaiting_pong:          timeout = c._opts.pong_timeout
-	case c._opts.ping_interval > 0: timeout = c._opts.ping_interval
-	case:                           timeout = nbio.NO_TIMEOUT
-	}
+	// Idle connections are handled by the keepalive timer, not per read.
+	timeout := c._opts.close_timeout if c.state == .Closing else nbio.NO_TIMEOUT
 
 	c._recv_pending = true
 	// The unused capacity of the buffer (slicing the dynamic array itself is bounded by its length).
@@ -292,8 +363,7 @@ on_recv :: proc(op: ^nbio.Operation, c: ^Conn) {
 
 	if op.recv.err != nil {
 		if op.recv.err == net.TCP_Recv_Error.Timeout {
-			on_read_timeout(c)
-			return
+			log.debug("websocket: peer did not finish closing in time")
 		}
 		abort(c)
 		return
@@ -305,6 +375,7 @@ on_recv :: proc(op: ^nbio.Operation, c: ^Conn) {
 	}
 
 	(^runtime.Raw_Dynamic_Array)(&c._rbuf).len += op.recv.received
+	c._last_rx = nbio.now()
 	c._awaiting_pong = false
 
 	context.temp_allocator = c._temp
@@ -316,19 +387,42 @@ on_recv :: proc(op: ^nbio.Operation, c: ^Conn) {
 }
 
 @(private)
-on_read_timeout :: proc(c: ^Conn) {
-	switch {
-	case c.state == .Closing:
-		log.debug("websocket: peer did not complete the close handshake in time")
-		abort(c)
-	case c._awaiting_pong:
-		log.debug("websocket: peer did not respond to ping")
-		abort(c)
-	case:
-		c._awaiting_pong = true
-		queue_frame(c, .Ping, nil)
-		start_recv(c)
+arm_keepalive :: proc(c: ^Conn, after: time.Duration) {
+	c._keepalive = nbio.timeout_poly(max(after, time.Millisecond), c, on_keepalive)
+}
+
+/*
+Runs every `ping_interval` (or `pong_timeout` while waiting for a pong): pings a connection that
+has been quiet for `ping_interval`, closes it when nothing came back within `pong_timeout`.
+*/
+@(private)
+on_keepalive :: proc(_: ^nbio.Operation, c: ^Conn) {
+	c._keepalive = nil
+	enter(c)
+	defer leave(c)
+	if c._aborting || c.state != .Open { return }
+
+	now := nbio.now()
+	if c._awaiting_pong {
+		waited := time.diff(c._ping_sent, now)
+		if waited >= c._opts.pong_timeout {
+			log.debug("websocket: peer did not respond to ping")
+			abort(c)
+			return
+		}
+		arm_keepalive(c, c._opts.pong_timeout - waited)
+		return
 	}
+
+	idle := time.diff(c._last_rx, now)
+	if idle >= c._opts.ping_interval {
+		c._awaiting_pong = true
+		c._ping_sent = now
+		queue_frame(c, .Ping, nil)
+		arm_keepalive(c, c._opts.pong_timeout)
+		return
+	}
+	arm_keepalive(c, c._opts.ping_interval - idle)
 }
 
 // Parses and handles all complete frames in the read buffer.
@@ -645,11 +739,11 @@ push_frame :: proc(c: ^Conn, opcode: Opcode, payload: []byte, is_close := false,
 	f := Out_Frame{buf = buf, payload_len = len(payload), close = is_close, data = !is_control(opcode)}
 	if f.data { c._queued_bytes += len(payload) }
 
-	// Pings/pongs jump ahead of queued data (but not of a frame already being written, nor of
+	// Pings/pongs jump ahead of queued data (but not of frames already being written, nor of
 	// earlier pings/pongs, so pongs go out in the order their pings came in);
 	// everything else, including close, keeps its order.
 	if opcode == .Ping || opcode == .Pong {
-		at := 1 if c._send_pending else 0
+		at := c._inflight if c._send_pending else 0
 		at = min(at, len(c._queue))
 		for at < len(c._queue) && !c._queue[at].data && !c._queue[at].close {
 			at += 1
@@ -670,13 +764,24 @@ next_mask :: proc(c: ^Conn) -> (m: [4]byte) {
 	return
 }
 
+// Most frames written with one (vectored) send.
+@(private)
+MAX_SEND_BATCH :: 64
+
 @(private)
 send_next :: proc(c: ^Conn) {
 	if c._send_pending || c._aborting || len(c._queue) == 0 { return }
-	f := &c._queue[0]
+	// Everything queued (up to a limit) in one go: one operation for many small messages.
+	n := min(len(c._queue), MAX_SEND_BATCH)
+	bufs: [MAX_SEND_BATCH][]byte
+	for i in 0 ..< n {
+		f := &c._queue[i]
+		bufs[i] = f.buf[f.sent:]
+	}
+	c._inflight = n
 	c._send_pending = true
 	timeout := c._write_timeout if c._write_timeout > 0 else nbio.NO_TIMEOUT
-	nbio.send_poly(c._socket, {f.buf[f.sent:]}, c, on_sent, all = false, timeout = timeout)
+	nbio.send_poly(c._socket, bufs[:n], c, on_sent, all = false, timeout = timeout)
 }
 
 @(private)
@@ -691,23 +796,33 @@ on_sent :: proc(op: ^nbio.Operation, c: ^Conn) {
 		return
 	}
 
-	f := &c._queue[0]
-	f.sent += op.send.sent
-	if f.sent < len(f.buf) {
-		send_next(c)
-		return
-	}
-
-	done := f^
-	ordered_remove(&c._queue, 0)
-	if done.data { c._queued_bytes -= done.payload_len }
-	delete(done.buf, c._allocator)
-
-	if done.close {
-		if c._close_after_send || c._close_received {
-			finish_close(c)
-			return
+	// Account the written bytes to the frames in flight, in order.
+	sent := op.send.sent
+	done := 0
+	for i in 0 ..< c._inflight {
+		f := &c._queue[i]
+		left := len(f.buf) - f.sent
+		if sent < left {
+			f.sent += sent
+			break
 		}
+		sent -= left
+		f.sent = len(f.buf)
+		done += 1
+	}
+	c._inflight = 0
+
+	close_sent := false
+	for f in c._queue[:done] {
+		if f.data { c._queued_bytes -= f.payload_len }
+		if f.close { close_sent = true }
+		frame_free(c, f)
+	}
+	remove_range(&c._queue, 0, done)
+
+	if close_sent && (c._close_after_send || c._close_received) {
+		finish_close(c)
+		return
 	}
 
 	if len(c._queue) == 0 {
@@ -760,6 +875,10 @@ maybe_finalize :: proc(c: ^Conn) {
 		nbio.remove(c._close_timer)
 		c._close_timer = nil
 	}
+	if c._keepalive != nil {
+		nbio.remove(c._keepalive)
+		c._keepalive = nil
+	}
 
 	// The peer's code if the handshake happened, else the code we failed with, else 1006.
 	code, reason := u16(Close_Code.Abnormal), ""
@@ -772,7 +891,7 @@ maybe_finalize :: proc(c: ^Conn) {
 		c._cb.on_close(c, code, reason)
 	}
 
-	for f in c._queue { delete(f.buf, c._allocator) }
+	for f in c._queue { frame_free(c, f) }
 	delete(c._queue)
 	delete(c._rbuf)
 	delete(c._msg)

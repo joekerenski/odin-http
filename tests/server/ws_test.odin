@@ -4,6 +4,7 @@ import "core:bytes"
 import "core:encoding/endian"
 import "core:fmt"
 import "core:math/rand"
+import "core:mem"
 import "core:net"
 import "core:strings"
 import "core:sync"
@@ -437,6 +438,68 @@ ws_send_from_other_thread :: proc(t: ^testing.T) {
 
 	// The connection is gone: sending to its handle is a no-op.
 	ws.send_from_any_thread(cross_handle, .Text, transmute([]byte)string("nobody home"))
+}
+
+@(private="file")
+bcast_handle: ws.Handle
+@(private="file")
+bcast_ready: sync.Sema
+
+// A big broadcast used to be copied once per handle into the target loop's mailbox, and while the
+// loop was busy everything beyond MAILBOX_LIMIT (64MiB) was dropped silently. Now it's one copy
+// per loop and one shared frame.
+@(test)
+ws_broadcast_large_fanout :: proc(t: ^testing.T) {
+	testing.set_fail_timeout(t, 30 * time.Second)
+	h := http.handler(proc(req: ^http.Request, res: ^http.Response) {
+		ws.upgrade(req, res, {send_queue_limit = 256 * mem.Megabyte}, {
+			on_open = proc(c: ^ws.Conn) {
+				bcast_handle = ws.handle(c)
+				sync.sema_post(&bcast_ready)
+			},
+			// Keeps the event loop busy, so the broadcast piles up in its mailbox.
+			on_message = proc(c: ^ws.Conn, _: ws.Message_Kind, data: []byte) {
+				if string(data) == "block" { time.sleep(300 * time.Millisecond) }
+			},
+		})
+	})
+	ts := server_start(t, h)
+	defer server_stop(ts)
+
+	c, _, ok := ws_dial(t, ts)
+	if !testing.expect(t, ok) { return }
+	defer net.close(c.sock)
+	// The read buffer on the heap: the temp allocator is reset after every message below.
+	rbuf := make([dynamic]byte)
+	append(&rbuf, ..c.buf[:])
+	c.buf = rbuf
+	defer delete(c.buf)
+	if !testing.expect(t, sync.sema_wait_with_timeout(&bcast_ready, 2 * time.Second)) { return }
+
+	// 1000 x 100KiB = ~98MiB, over the mailbox limit if it were copied per handle.
+	N :: 1000
+	payload := make([]byte, 100 * 1024)
+	defer delete(payload)
+	for &b, i in payload { b = byte(i * 31) }
+	handles := make([]ws.Handle, N)
+	defer delete(handles)
+	for &hd in handles { hd = bcast_handle }
+	ws_send(&c, .Text, transmute([]byte)string("block"))
+	time.sleep(50 * time.Millisecond)
+	ws.broadcast(handles, .Binary, payload)
+
+	got := 0
+	for got < N {
+		f, fok := ws_recv(&c, 5 * time.Second)
+		if !fok { break }
+		if f.opcode != .Binary || !bytes.equal(f.payload, payload) {
+			testing.expectf(t, false, "message %i: %v, %i bytes", got, f.opcode, len(f.payload))
+			break
+		}
+		got += 1
+		free_all(context.temp_allocator)
+	}
+	testing.expectf(t, got == N, "got %i/%i broadcast messages", got, N)
 }
 
 WS_FUZZ_ITERATIONS :: #config(WS_FUZZ_ITERATIONS, 600)

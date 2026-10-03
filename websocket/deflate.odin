@@ -163,7 +163,7 @@ Inflater :: struct {
 @(private)
 deflater_init :: proc(d: ^Deflater, window_bits: int, level: int, reset: bool) -> bool {
 	bits := window_bits if window_bits > 0 else 15
-	lvl := level if level > 0 else 6
+	lvl := level if level > 0 else 1
 	// Raw deflate (negative window bits), memLevel 8 (zlib's default).
 	d.ready = zlib.deflateInit2(&d.strm, c.int(lvl), zlib.DEFLATED, -c.int(bits), 8, zlib.DEFAULT_STRATEGY) == zlib.OK
 	d.reset = reset
