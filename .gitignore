@@ -17,3 +17,4 @@ autobahn/reports/
 autobahn/echo-server
 
 .claude/settings.local.json
+.hunt-bt.txt

@@ -1,5 +1,7 @@
 package tests_server
 
+import "base:runtime"
+
 import "core:strings"
 import "core:testing"
 import "core:time"
@@ -155,6 +157,9 @@ shutdown_with_active_connection :: proc(t: ^testing.T) {
 	hang := http.handler(proc(_: ^http.Request, _: ^http.Response) {})
 	opts := fast_opts()
 	opts.shutdown_timeout = 300 * time.Millisecond
+	// The abandoned connection's memory is leaked on purpose (the handler may still hold the
+	// request/response), keep it out of the leak check.
+	context.allocator = runtime.heap_allocator()
 	ts := server_start(t, hang, opts)
 
 	c, _ := raw_dial(ts)

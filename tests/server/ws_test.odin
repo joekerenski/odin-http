@@ -23,7 +23,11 @@ Ws_Client :: struct {
 }
 
 ws_dial :: proc(t: ^testing.T, ts: ^Test_Server, extra_headers := "", first_frames: []byte = nil) -> (c: Ws_Client, head: string, ok: bool) {
-	sock, err := net.dial_tcp(net.Endpoint{address = net.IP4_Loopback, port = ts.port})
+	return ws_dial_port(ts.port, extra_headers, first_frames)
+}
+
+ws_dial_port :: proc(port: int, extra_headers := "", first_frames: []byte = nil) -> (c: Ws_Client, head: string, ok: bool) {
+	sock, err := net.dial_tcp(net.Endpoint{address = net.IP4_Loopback, port = port})
 	if err != nil { return }
 	c.sock = sock
 	c.buf.allocator = context.temp_allocator
@@ -60,6 +64,17 @@ ws_send :: proc(c: ^Ws_Client, opcode: ws.Opcode, payload: []byte, fin := true, 
 	copy(body, payload)
 	if masked { ws.apply_mask(body, mask) }
 	raw_send({c.sock}, strings.concatenate({string(h), string(body)}, context.temp_allocator))
+}
+
+ws_frame_bytes :: proc(opcode: ws.Opcode, payload: []byte, masked := true) -> []byte {
+	hdr: [ws.MAX_HEADER_SIZE]byte
+	mask := [4]byte{0x12, 0x34, 0x56, 0x78}
+	h := ws.write_header(hdr[:], true, opcode, len(payload), mask if masked else nil)
+	out := make([]byte, len(h) + len(payload), context.temp_allocator)
+	copy(out, h)
+	copy(out[len(h):], payload)
+	if masked { ws.apply_mask(out[len(h):], mask) }
+	return out
 }
 
 Ws_Frame :: struct {
@@ -213,6 +228,50 @@ ws_pongs_in_order :: proc(t: ^testing.T) {
 		want := fmt.tprintf("payload-%i", i)
 		testing.expectf(t, fok && f.opcode == .Pong && string(f.payload) == want, "pong %i: want %q, got %v", i, want, f)
 	}
+}
+
+@(test)
+ws_close_handshakes_dont_use_freed_conn :: proc(t: ^testing.T) {
+	// Completing a close handshake used to free the connection in the middle of processing the
+	// close frame (and keep using it). With the quarantine allocator any such use reads zeros.
+	testing.set_fail_timeout(t, 10 * time.Second)
+	q: Quarantine
+	context.allocator = quarantine_allocator(&q)
+	ts := server_start(t, ws_echo_handler())
+	defer server_stop(ts)
+
+	for i in 0 ..< 3 {
+		c, _, ok := ws_dial(t, ts)
+		if !testing.expect(t, ok) { return }
+		switch i {
+		case 0: // The server closes, we reply.
+			ws_send(&c, .Text, transmute([]byte)string("close-me"))
+			f, fok := ws_recv(&c)
+			testing.expectf(t, fok && f.opcode == .Close, "got %v", f)
+			ws_send(&c, .Close, close_payload(1000))
+		case 1: // We close, the server replies.
+			ws_send(&c, .Close, close_payload(1000))
+			ws_expect_close(t, &c, 1000)
+		case 2: // A protocol error with more frames behind it in the same read.
+			frames := strings.concatenate({
+				string(ws_frame_bytes(.Text, transmute([]byte)string("x"), masked = false)),
+				string(ws_frame_bytes(.Text, transmute([]byte)string("y"))),
+			}, context.temp_allocator)
+			raw_send({c.sock}, frames)
+			ws_expect_close(t, &c, 1002)
+		}
+		_, closed := raw_recv({c.sock}, 2 * time.Second)
+		testing.expectf(t, closed, "case %i: TCP connection not closed", i)
+		net.close(c.sock)
+	}
+
+	// The event loop is still fine.
+	c, _, ok := ws_dial(t, ts)
+	if !testing.expect(t, ok) { return }
+	defer net.close(c.sock)
+	ws_send(&c, .Text, transmute([]byte)string("still here"))
+	f, fok := ws_recv(&c)
+	testing.expectf(t, fok && string(f.payload) == "still here", "got %v", f)
 }
 
 @(test)

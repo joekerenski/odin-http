@@ -337,6 +337,11 @@ _server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
 		// still hold on to the request/response.
 		if forced && time.tick_since(start) > 2 * s.opts.shutdown_timeout + 2 * Conn_Close_Delay {
 			log.warnf("shutdown: abandoning %i connections whose handlers never responded", len(td.conns))
+			// Their sockets have no I/O pending (and the loop goes away), close them so the
+			// file descriptors don't leak with the memory.
+			for sock in td.conns {
+				net.close(sock)
+			}
 			break
 		}
 

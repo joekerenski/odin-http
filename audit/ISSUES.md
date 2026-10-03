@@ -13,7 +13,11 @@ This file is the working checklist. Finding IDs (S/F/C) refer to [REPORT.md](REP
 - [x] **T2** Unit tests for every parser: request line, version, header line, Content-Length, chunk size, Transfer-Encoding list, Connection list, cookies, dates, URL / percent-decoding, MIME lookup. (b10286d)
 - [x] **T3** Fuzz drivers for the parsers (random + mutational from a seed corpus) with invariants: no panic, bounded allocation, round-trip where applicable. Run in CI for a fixed time budget. (cf81da8)
 - [x] **T4** Pipelining / keep-alive tests: N requests on one connection with mixed bodies, verify exact response framing. (8625991)
-- [ ] **T5** Concurrency tests: many connections across threads, shutdown under load, no leaks (tracking allocator) and clean ASan.
+- [x] **T5** Concurrency tests: many connections across threads, shutdown under load, no leaks (tracking allocator) and clean ASan.
+  - `tests/server/stress_test.odin`: mixed HTTP (keep-alive, pipelining, chunked uploads, aborts mid-head/body, RSTs, unread responses, half-closes, garbage), WebSockets with cross-thread broadcasts and closes, shutdown under load. Off by default; `scripts/test-linux.sh --stress N [--asan]` (container capped at 2 CPUs / 2 GiB, per-step time and log limits).
+  - All suites run with `ODIN_TEST_FAIL_ON_BAD_MEMORY`: leaks fail the test.
+  - `Quarantine` allocator in the harness (zeroes freed memory, never reuses it) turns use-after-free into immediate failures; ASan can't see Odin heap frees.
+  - `scripts/test-linux.sh --hunt [RUNS]`: repeat the stress tests until one fails or hangs, with a gdb thread dump on hangs.
 - [ ] **T6** Client test harness: crafted-response server (status, framing, TLS with a local CA, truncation, slow responses).
 - [ ] **T7** Interop: real curl / Python clients against the server; real servers against the client; Caddy in front of the server (docker) for the pooled-connection cases.
 - [x] **T8** CI: run all of the above on Linux, macOS and Windows; drop the non-compiling examples or fix them (S23). (4336bc3)
@@ -86,6 +90,15 @@ This file is the working checklist. Finding IDs (S/F/C) refer to [REPORT.md](REP
 - [ ] **W8** Autobahn TestSuite (fuzzingclient against our server, fuzzingserver against our client) in docker: 100% pass on cases 1-11 (non-compression), informational cases reviewed.
   - Server side done: `autobahn/run.sh`. 296 OK, 0 failed; 6.4.3/6.4.4 NON-STRICT (invalid UTF-8 is detected once the whole frame has arrived, not mid-frame); 7.1.6/7.13.x informational. Case 9 (performance) shows nothing slow. Fixed 2.10 (pongs were sent in reverse order). Client side waits for W7.
 - [ ] **W9** `permessage-deflate` (RFC 7692) via `vendor:zlib`, with decompression-bomb limits; Autobahn 12-13.
+
+## Found by the stress tests (2026-10-03)
+
+- [x] **W10** Use-after-free: a WebSocket connection could be finalized (freed) inside frame processing, e.g. when the peer's close frame completed a close we started, or on a protocol error after our close was queued, and then used again by `process`/`on_recv`. Symptoms, depending on what reused the memory: an endless loop on the event loop thread (its connections starve), an `nbio` assertion (recv with an empty buffer) or nothing. Fix: connections are marked busy while an I/O completion runs and only finalized when it returns. Test: `ws_close_handshakes_dont_use_freed_conn` (quarantine allocator).
+- [x] **W11** Cross-thread `send`/`close`/`broadcast` queued one `nbio` operation per message on the target loop: a busy or stalled loop filled its queue and the sending thread spun forever (logging every iteration, 11 GB in 5 minutes); after a server shutdown it targeted event loops that no longer exist. Fix: one mailbox per loop, at most one queued wake-up, closed with the loop's last connection (sends are dropped after that), capped at `MAILBOX_LIMIT`.
+- [x] **S24** Shutdown abandoned connections (handler never responded) without closing their sockets: one leaked file descriptor each.
+- [x] **S25** `listen` logged event loop errors as `%!(BAD ENUM VALUE=1)`; it logs the OS error number now, with an io_uring hint on Linux.
+- [x] **T9** The server test suite hung forever when the server could not start (e.g. io_uring blocked in docker).
+- Note: `core:net`'s `set_option(.Linger)` passes a `timeval` where the OS expects a `struct linger`; the stress client sets `SO_LINGER` through `core:sys/posix`.
 
 ## Phase 5: Client
 

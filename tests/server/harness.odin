@@ -1,8 +1,13 @@
 // Black-box regression tests: run a real server on an ephemeral port and talk raw bytes to it.
 package tests_server
 
+import "base:runtime"
+
 import "core:bytes"
+import "core:debug/trace"
 import "core:io"
+import "core:log"
+import "core:mem"
 import "core:net"
 import "core:strings"
 import "core:sync"
@@ -21,14 +26,23 @@ Test_Server :: struct {
 	thread:  ^thread.Thread,
 }
 
-// Starts a single-threaded server on 127.0.0.1 with an OS-assigned port.
-server_start :: proc(t: ^testing.T, handler: http.Handler, opts := http.Default_Server_Opts) -> ^Test_Server {
+// Print a back trace when an assertion fails on a server thread (and abort), for debugging crashes:
+// -define:TRACE_ASSERTIONS=true -debug
+TRACE_ASSERTIONS :: #config(TRACE_ASSERTIONS, false)
+trace_assertion_proc :: trace.assertion_failure_proc
+
+// Starts a server (single-threaded by default) on 127.0.0.1 with an OS-assigned port.
+server_start :: proc(t: ^testing.T, handler: http.Handler, opts := http.Default_Server_Opts, threads := 1) -> ^Test_Server {
 	ts := new(Test_Server)
 	ts.handler = handler
 	ts.opts = opts
-	ts.opts.thread_count = 1
+	ts.opts.thread_count = threads
 
 	ts.thread = thread.create_and_start_with_poly_data(ts, proc(ts: ^Test_Server) {
+		when TRACE_ASSERTIONS {
+			// Inherited by the server threads: a failed assertion prints a back trace and aborts.
+			context.assertion_failure_proc = trace_assertion_proc
+		}
 		err := http.listen(&ts.server, {address = net.IP4_Loopback, port = 0}, ts.opts)
 		if err != nil {
 			sync.sema_post(&ts.ready)
@@ -228,4 +242,70 @@ thread_start_stop :: proc(ts: ^Test_Server) -> ^thread.Thread {
 thread_join_stop :: proc(th: ^thread.Thread) {
 	thread.join(th)
 	thread.destroy(th)
+}
+
+/*
+An allocator for catching use-after-free: freed memory is zeroed and never reused, so a stale
+pointer reads zeros (which trips an assertion or a nil dereference right away) instead of someone
+else's data. Freeing memory it doesn't know (double free, wrong allocator) is logged as an error.
+It never gives memory back, only use it for short tests:
+
+	q: Quarantine
+	context.allocator = quarantine_allocator(&q)
+	ts := server_start(t, ...)
+*/
+Quarantine :: struct {
+	mu:    sync.Mutex,
+	sizes: map[rawptr]int,
+}
+
+quarantine_allocator :: proc(q: ^Quarantine) -> mem.Allocator {
+	q.sizes = make(map[rawptr]int, 256, runtime.heap_allocator())
+	return {procedure = quarantine_proc, data = q}
+}
+
+@(private)
+quarantine_proc :: proc(data: rawptr, mode: mem.Allocator_Mode, size, alignment: int, old_memory: rawptr, old_size: int, loc := #caller_location) -> ([]byte, mem.Allocator_Error) {
+	q := (^Quarantine)(data)
+	heap := runtime.heap_allocator()
+	sync.guard(&q.mu)
+
+	retire :: proc(q: ^Quarantine, ptr: rawptr, loc: runtime.Source_Code_Location) -> (n: int) {
+		ok: bool
+		if n, ok = q.sizes[ptr]; !ok {
+			log.errorf("quarantine: freeing unknown memory %p (double free or wrong allocator)", ptr, location = loc)
+			return 0
+		}
+		mem.zero(ptr, n)
+		delete_key(&q.sizes, ptr)
+		return
+	}
+
+	switch mode {
+	case .Alloc, .Alloc_Non_Zeroed:
+		b, err := mem.alloc_bytes(size, alignment, heap)
+		if err == nil && size > 0 { q.sizes[raw_data(b)] = size }
+		return b, err
+	case .Free:
+		if old_memory != nil { retire(q, old_memory, loc) }
+		return nil, nil
+	case .Resize, .Resize_Non_Zeroed:
+		b, err := mem.alloc_bytes(size, alignment, heap)
+		if err != nil { return nil, err }
+		if old_memory != nil {
+			n := q.sizes[old_memory]
+			copy(b, ([^]byte)(old_memory)[:min(n, size)])
+			retire(q, old_memory, loc)
+		}
+		if size > 0 { q.sizes[raw_data(b)] = size }
+		return b, nil
+	case .Query_Features:
+		if set := (^mem.Allocator_Mode_Set)(old_memory); set != nil {
+			set^ = {.Alloc, .Alloc_Non_Zeroed, .Free, .Resize, .Resize_Non_Zeroed, .Query_Features}
+		}
+		return nil, nil
+	case .Free_All, .Query_Info:
+		return nil, .Mode_Not_Implemented
+	}
+	return nil, nil
 }

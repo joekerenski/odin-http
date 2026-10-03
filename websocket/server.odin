@@ -118,6 +118,8 @@ Conn :: struct {
 	_close_queued:     bool,
 	_close_after_send: bool,
 	_close_received:   bool,
+	// Entry points (I/O completions) running for this connection, see `enter`.
+	_busy:             int,
 	_close_timer:      ^nbio.Operation,
 	_peer_code:        u16,
 	_peer_reason:      string,
@@ -287,6 +289,8 @@ on_hijacked :: proc(user: rawptr, h: http.Hijacked, buffered: []byte, ok: bool) 
 	c._h = h
 	c.state = .Open
 	register(c)
+	enter(c)
+	defer leave(c)
 	c._write_timeout = http.hijacked_server_opts(h).write_timeout
 	append(&c._rbuf, ..buffered)
 
@@ -331,10 +335,9 @@ start_recv :: proc(c: ^Conn) {
 @(private)
 on_recv :: proc(op: ^nbio.Operation, c: ^Conn) {
 	c._recv_pending = false
-	if c._aborting {
-		maybe_finalize(c)
-		return
-	}
+	enter(c)
+	defer leave(c)
+	if c._aborting { return }
 
 	if op.recv.err != nil {
 		if op.recv.err == net.TCP_Recv_Error.Timeout {
@@ -606,10 +609,9 @@ send_next :: proc(c: ^Conn) {
 @(private)
 on_sent :: proc(op: ^nbio.Operation, c: ^Conn) {
 	c._send_pending = false
-	if c._aborting {
-		maybe_finalize(c)
-		return
-	}
+	enter(c)
+	defer leave(c)
+	if c._aborting { return }
 	if op.send.err != nil {
 		log.debugf("websocket: send failed: %v", op.send.err)
 		abort(c)
@@ -654,9 +656,27 @@ abort :: proc(c: ^Conn) {
 	maybe_finalize(c)
 }
 
+/*
+I/O completions run code that can abort the connection (protocol errors, the close handshake,
+user callbacks calling `close`) and then keep using it. While one runs the connection is busy and
+can't be freed, it's finalized when the last entry point returns.
+*/
+@(private)
+enter :: proc(c: ^Conn) {
+	c._busy += 1
+}
+
+@(private)
+leave :: proc(c: ^Conn) {
+	c._busy -= 1
+	if c._busy == 0 {
+		maybe_finalize(c)
+	}
+}
+
 @(private)
 maybe_finalize :: proc(c: ^Conn) {
-	if !c._aborting || c._recv_pending || c._send_pending || c._finalized { return }
+	if !c._aborting || c._busy > 0 || c._recv_pending || c._send_pending || c._finalized { return }
 	c._finalized = true
 	c.state = .Closed
 	unregister(c)
