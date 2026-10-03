@@ -8,7 +8,10 @@ import "core:math/rand"
 import "core:strings"
 import "core:testing"
 
+import "core:mem/virtual"
+
 import http "../.."
+import "../../client"
 
 FUZZ_ITERATIONS :: #config(FUZZ_ITERATIONS, 200_000)
 
@@ -30,7 +33,7 @@ SEEDS := []string{
 INTERESTING := []byte{0, '\r', '\n', '\t', ' ', ':', ';', ',', '=', '-', '+', '_', '0', '9', 'a', 'f', 'x', 0x7f, 0x80, 0xff, '%', '/', '?', '#'}
 
 // Produces a random mutation of a seed (or pure random bytes), allocated in the temp allocator.
-mutate :: proc(r: ^rand.Generator) -> string {
+mutate :: proc(r: ^rand.Generator, seeds := SEEDS) -> string {
 	context.random_generator = r^
 	buf := make([dynamic]byte, context.temp_allocator)
 
@@ -40,7 +43,7 @@ mutate :: proc(r: ^rand.Generator) -> string {
 		return string(buf[:])
 	}
 
-	append(&buf, ..transmute([]byte)rand.choice(SEEDS))
+	append(&buf, ..transmute([]byte)rand.choice(seeds))
 	for _ in 0 ..< 1 + rand.int_max(6) {
 		pos := rand.int_max(len(buf) + 1)
 		switch rand.int_max(5) {
@@ -57,7 +60,7 @@ mutate :: proc(r: ^rand.Generator) -> string {
 				inject_at(&buf, pos, ..buf[a:b])
 			}
 		case 4: // splice in another seed
-			inject_at(&buf, pos, ..transmute([]byte)rand.choice(SEEDS))
+			inject_at(&buf, pos, ..transmute([]byte)rand.choice(seeds))
 		}
 	}
 	return string(buf[:])
@@ -147,6 +150,57 @@ fuzz_cookies_and_dates :: proc(t: ^testing.T) {
 		_, _ = http.cookie_parse(s, context.temp_allocator)
 		_, _ = http.date_parse(s)
 		_ = http.url_parse(s)
+		free_all(context.temp_allocator)
+	}
+}
+
+RESPONSE_SEEDS := []string{
+	"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello",
+	"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;x=y\r\nhello\r\n0\r\nX-T: 1\r\n\r\n",
+	"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 204 No Content\r\n\r\n",
+	"HTTP/1.0 200 OK\nSet-Cookie: a=b; Path=/\n\nbody until close",
+	"HTTP/1.1 200 OK\r\nContent-Length: 3, 3\r\nTransfer-Encoding: gzip, chunked\r\n\r\n",
+	"HTTP/1.1 304 Not Modified\r\nContent-Length: 10\r\n\r\n",
+}
+
+// The client's response parser on mutated responses, fed in random pieces.
+@(test)
+fuzz_client_response :: proc(t: ^testing.T) {
+	r := context.random_generator
+	opts := client.Default_Opts
+	opts.max_header_size = 1024
+	opts.max_headers     = 20
+	opts.max_body_size   = 4096
+	for _ in 0 ..< FUZZ_ITERATIONS / 10 {
+		input := mutate(&r, RESPONSE_SEEDS)
+
+		arena: virtual.Arena
+		_ = virtual.arena_init_growing(&arena)
+		p: client.Parser
+		client.parser_init(&p, opts, rand.int_max(8, r) == 0, virtual.arena_allocator(&arena), context.temp_allocator)
+
+		buf := make([dynamic]byte, context.temp_allocator)
+		rest := input
+		err: client.Error
+		for len(rest) > 0 && err == nil && p.state != .Done {
+			n := 1 + int(rand.int_max(min(len(rest), 32), r))
+			append(&buf, ..transmute([]byte)rest[:n])
+			rest = rest[n:]
+			consumed: int
+			consumed, err = client.parser_feed(&p, buf[:])
+			testing.expect(t, consumed >= 0 && consumed <= len(buf))
+			remove_range(&buf, 0, consumed)
+		}
+		if err == nil && p.state != .Done { err = client.parser_eof(&p) }
+
+		if err == nil {
+			testing.expectf(t, p.status >= 200 && p.status <= 999, "status %v from %q", p.status, input)
+			testing.expectf(t, len(p.body) <= opts.max_body_size, "body of %i from %q", len(p.body), input)
+			for k, v in p.headers._kv {
+				testing.expectf(t, http.is_token(k) && http.is_field_value(v), "header %q: %q from %q", k, v, input)
+			}
+		}
+		virtual.arena_destroy(&arena)
 		free_all(context.temp_allocator)
 	}
 }

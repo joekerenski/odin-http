@@ -6,7 +6,6 @@ import "core:log"
 import "core:nbio"
 import "core:net"
 import "core:strings"
-import "core:sync"
 import "core:time"
 
 import "../openssl"
@@ -126,70 +125,11 @@ io_error_send :: proc(err: net.Send_Error) -> IO_Error {
 
 // --- TLS ---
 
-@(private)
-default_ctx: ^openssl.SSL_CTX
-@(private)
-default_ctx_once: sync.Once
-
-/*
-A client context that verifies the server: its certificate chain against the system's trust store,
-or the CAs in `ca_file` (PEM) when given, and TLS 1.2 at least. The host name is checked per
-connection (`tls_init`).
-*/
-@(private)
-tls_client_ctx :: proc(ca_file: string) -> ^openssl.SSL_CTX {
-	make_ctx :: proc(ca_file: string) -> ^openssl.SSL_CTX {
-		ctx := openssl.SSL_CTX_new(openssl.TLS_client_method())
-		if ctx == nil { return nil }
-		ok: i32
-		if ca_file == "" {
-			ok = openssl.SSL_CTX_set_default_verify_paths(ctx)
-		} else {
-			ok = openssl.SSL_CTX_load_verify_locations(ctx, strings.clone_to_cstring(ca_file, context.temp_allocator), nil)
-		}
-		if ok != 1 || openssl.SSL_CTX_set_min_proto_version(ctx, openssl.TLS1_2_VERSION) != 1 {
-			log.warnf("websocket: TLS setup failed: %s", tls_error_string())
-			openssl.SSL_CTX_free(ctx)
-			return nil
-		}
-		openssl.SSL_CTX_set_verify(ctx, openssl.SSL_VERIFY_PEER, nil)
-		return ctx
-	}
-
-	if ca_file != "" { return make_ctx(ca_file) }
-	sync.once_do(&default_ctx_once, proc() { default_ctx = make_ctx("") })
-	return default_ctx
-}
-
-// Sets up TLS for a client connection to `host` (a name or an IP address, without brackets).
+// Sets up TLS for a client connection to `host` (a name or an IP address, without brackets), with
+// a context from `openssl.client_ctx`.
 @(private)
 tls_init :: proc(c: ^Conn, ctx: ^openssl.SSL_CTX, host: string, is_ip: bool) -> bool {
-	ssl := openssl.SSL_new(ctx)
-	if ssl == nil { return false }
-	rbio := openssl.BIO_new(openssl.BIO_s_mem())
-	wbio := openssl.BIO_new(openssl.BIO_s_mem())
-	if rbio == nil || wbio == nil {
-		if rbio != nil { openssl.BIO_free(rbio) }
-		if wbio != nil { openssl.BIO_free(wbio) }
-		openssl.SSL_free(ssl)
-		return false
-	}
-	openssl.SSL_set_bio(ssl, rbio, wbio)
-	openssl.SSL_set_connect_state(ssl)
-
-	chost := strings.clone_to_cstring(host, context.temp_allocator)
-	ok: bool
-	if is_ip {
-		// No SNI for addresses (RFC 6066 3), and the certificate must name the address.
-		ok = openssl.X509_VERIFY_PARAM_set1_ip_asc(openssl.SSL_get0_param(ssl), chost) == 1
-	} else {
-		ok = openssl.SSL_set_tlsext_host_name(ssl, chost) == 1 && openssl.SSL_set1_host(ssl, chost) == 1
-	}
-	if !ok {
-		openssl.SSL_free(ssl)
-		return false
-	}
-
+	ssl, rbio, wbio := openssl.client_ssl(ctx, host, is_ip) or_return
 	t := new(Tls, c._allocator)
 	t.ssl, t.rbio, t.wbio = ssl, rbio, wbio
 	t.cin = make([]byte, TLS_READ_SIZE, c._allocator)
@@ -270,10 +210,10 @@ tls_handshake_step :: proc(c: ^Conn) {
 			}
 		}, timeout = handshake_time_left(c))
 	case:
-		if v := openssl.SSL_get_verify_result(t.ssl); v != openssl.X509_V_OK {
-			c._tls_handshake_done(c, strings.concatenate({"TLS: certificate verification failed: ", string(openssl.X509_verify_cert_error_string(v))}, context.temp_allocator))
+		if v := openssl.verify_error(t.ssl); v != "" {
+			c._tls_handshake_done(c, strings.concatenate({"TLS: certificate verification failed: ", v}, context.temp_allocator))
 		} else {
-			c._tls_handshake_done(c, strings.concatenate({"TLS handshake failed: ", tls_error_string()}, context.temp_allocator))
+			c._tls_handshake_done(c, strings.concatenate({"TLS handshake failed: ", openssl.error_string()}, context.temp_allocator))
 		}
 	}
 }
@@ -281,16 +221,7 @@ tls_handshake_step :: proc(c: ^Conn) {
 // Moves the ciphertext OpenSSL produced to `out`.
 @(private)
 tls_drain :: proc(t: ^Tls) {
-	for {
-		pending := int(openssl.BIO_ctrl_pending(t.wbio))
-		if pending <= 0 { return }
-		at := len(t.out)
-		non_zero_resize(&t.out, at + pending)
-		n := openssl.BIO_read(t.wbio, raw_data(t.out[at:]), i32(pending))
-		non_zero_resize(&t.out, at + max(int(n), 0))
-		t.queued_total += max(int(n), 0)
-		if n <= 0 { return }
-	}
+	t.queued_total += openssl.drain_bio(t.wbio, &t.out)
 }
 
 // Decrypts what's available into the pending receive, reading more ciphertext when needed.
@@ -337,7 +268,7 @@ tls_pump_recv :: proc(c: ^Conn) {
 			done(c, 0, .Closed)
 			return
 		case:
-			log.debugf("websocket: TLS read failed: %s", tls_error_string())
+			log.debugf("websocket: TLS read failed: %s", openssl.error_string())
 			t.failed = .Failed
 			t.recv_done, t.recv_buf = nil, nil
 			done(c, 0, .Failed)
@@ -396,7 +327,7 @@ tls_send :: proc(c: ^Conn, bufs: [][]byte, timeout: time.Duration, done: Send_Do
 		if len(b) == 0 { continue }
 		// Memory BIOs grow as needed, so the whole buffer is taken.
 		if r := openssl.SSL_write(t.ssl, raw_data(b), i32(len(b))); int(r) != len(b) {
-			log.debugf("websocket: TLS write failed: %s", tls_error_string())
+			log.debugf("websocket: TLS write failed: %s", openssl.error_string())
 			t.failed = .Failed
 			done(c, 0, .Failed)
 			return
@@ -455,20 +386,4 @@ tls_on_cipher_sent :: proc(op: ^nbio.Operation, c: ^Conn) {
 		if connecting { return } // See above.
 	}
 	tls_flush(c)
-}
-
-// OpenSSL's queued errors, as text (temp allocated).
-@(private)
-tls_error_string :: proc() -> string {
-	sb := strings.builder_make(context.temp_allocator)
-	for {
-		e := openssl.ERR_get_error()
-		if e == 0 { break }
-		buf: [256]byte
-		openssl.ERR_error_string_n(e, raw_data(buf[:]), len(buf))
-		if strings.builder_len(sb) > 0 { strings.write_string(&sb, "; ") }
-		strings.write_string(&sb, string(cstring(raw_data(buf[:]))))
-	}
-	if strings.builder_len(sb) == 0 { return "unknown error" }
-	return strings.to_string(sb)
 }

@@ -7,7 +7,7 @@ which sets:
     PROXY   https://localhost:8443   Caddy in front of it (TLS, HTTP/2 to clients, pooled upstream)
     CA          Caddy's root certificate
     FILE        the file the server serves at /file
-    ODIN_CLIENT tests/interop/client, the WebSocket client against Caddy
+    ODIN_CLIENT tests/interop/client, the WebSocket and HTTP clients against Caddy
 """
 
 import asyncio
@@ -304,8 +304,8 @@ class Proxy(Common, unittest.TestCase):
             self.assertEqual((r.status, body), (200, data), f"round {i}")
             time.sleep(2.5)
 
-    def test_odin_ws_client(self):
-        """The WebSocket client (wss:// through Caddy, see tests/interop/client)."""
+    def test_odin_clients(self):
+        """The WebSocket and HTTP clients (wss:// and https:// through Caddy, see tests/interop/client)."""
         p = subprocess.run([os.environ["ODIN_CLIENT"], CA], capture_output=True, timeout=120)
         out = p.stdout.decode() + p.stderr.decode()
         print("\n" + out.strip(), file=sys.stderr)

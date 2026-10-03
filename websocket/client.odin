@@ -14,6 +14,7 @@ package websocket
 import "core:encoding/base64"
 import "core:crypto"
 import "core:fmt"
+import "core:log"
 import "core:mem/virtual"
 import "core:nbio"
 import "core:net"
@@ -83,11 +84,14 @@ dial :: proc(url: string, opts: Dial_Opts, callbacks: Callbacks, allocator := co
 
 	ctx: ^openssl.SSL_CTX
 	if target.tls {
-		ctx = tls_client_ctx(opts.tls_ca_file)
-		if ctx == nil { return nil, .TLS_Setup_Failed }
+		ctx = openssl.client_ctx(opts.tls_ca_file)
+		if ctx == nil {
+			log.warnf("websocket: TLS setup failed: %s", openssl.error_string())
+			return nil, .TLS_Setup_Failed
+		}
 	}
-	// A context of our own (custom CA) is kept alive by the connection's SSL from here on.
-	defer if ctx != nil && opts.tls_ca_file != "" { openssl.SSL_CTX_free(ctx) }
+	// The connection's SSL keeps its own reference.
+	defer if ctx != nil { openssl.SSL_CTX_free(ctx) }
 
 	c = new(Conn, allocator)
 	conn_init(c, .Client, opts.opts, callbacks, allocator)

@@ -96,11 +96,13 @@ echo "odin $(odin version | awk '{print $NF}') on $(uname -sm)"
 step "examples typecheck"     check_examples
 step "unit"                   odin test tests/unit      -vet --strict-style $DEFS -out:"$OUT/unit"
 step "websocket codec"        odin test tests/websocket -vet --strict-style $DEFS -out:"$OUT/ws"
+step "client"                 odin test tests/client    -vet --strict-style $DEFS -out:"$OUT/client"
 step "server (live)"          odin test tests/server    -vet --strict-style $DEFS -out:"$OUT/server"
 step "parser fuzz"            odin test tests/fuzz -o:speed -define:FUZZ_ITERATIONS="$FUZZ_ITERATIONS" $DEFS -out:"$OUT/fuzz"
 if [ $ASAN = 1 ]; then
 	step "server (live, asan)"    odin test tests/server    -sanitize:address -debug $DEFS -out:"$OUT/server-asan"
 	step "websocket codec (asan)" odin test tests/websocket -sanitize:address -debug $DEFS -out:"$OUT/ws-asan"
+	step "client (asan)"          odin test tests/client    -sanitize:address -debug $DEFS -out:"$OUT/client-asan"
 fi
 if [ "$STRESS" != 0 ]; then
 	# One stress test at a time.

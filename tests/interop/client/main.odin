@@ -1,6 +1,6 @@
-// The WebSocket client against Caddy (wss://) and the interop server, run by
-// tests/interop/test_interop.py (Proxy.test_odin_ws_client). Prints one line per check, exits 1
-// if any failed.
+// The WebSocket and HTTP clients against Caddy (wss://, https://) and the interop server, run by
+// tests/interop/test_interop.py (Proxy.test_odin_clients). Prints one line per check, exits 1 if
+// any failed.
 //
 //	interop-client <caddy root CA (PEM)>
 package interop_client
@@ -14,6 +14,7 @@ import "core:os"
 import "core:strings"
 import "core:time"
 
+import "../../../client"
 import ws "../../../websocket"
 
 ca_file: string
@@ -43,7 +44,80 @@ main :: proc() {
 	// Caddy answers unknown names with the certificate for localhost).
 	refused("wss, certificate for another host", "wss://alias.test:8443/ws", ca_file, "mismatch")
 
+	http_checks()
+
 	os.exit(1 if failed else 0)
+}
+
+// --- HTTP client ---
+
+pattern :: proc(n: int) -> []byte {
+	b := make([]byte, n, context.temp_allocator)
+	for &c, i in b { c = byte(i % 251) }
+	return b
+}
+
+http_checks :: proc() {
+	opts := client.Default_Opts
+	opts.tls_ca_file = ca_file
+
+	{
+		res, err := client.get("https://localhost:8443/big?size=5000000", opts)
+		report("https GET 5 MB", err == nil && res.status == .OK && bytes.equal(transmute([]byte)res.body, pattern(5_000_000)), fmt.tprint(err, res.status, len(res.body)))
+		client.response_destroy(&res)
+	}
+	{
+		req: client.Request
+		client.request_init(&req, .Post, context.temp_allocator)
+		data := pattern(2_000_000)
+		bytes.buffer_write(&req.body, data)
+		res, err := client.request(&req, "https://localhost:8443/echo", opts)
+		report("https POST 2 MB echo", err == nil && bytes.equal(transmute([]byte)res.body, data), fmt.tprint(err, len(res.body)))
+		client.response_destroy(&res)
+	}
+	{
+		res, err := client.get("https://localhost:8443/stream?n=20000", opts)
+		want := strings.builder_make(context.temp_allocator)
+		for i in 0 ..< 20000 { fmt.sbprintf(&want, "line %i\n", i) }
+		report("https chunked response", err == nil && res.body == strings.to_string(want), fmt.tprint(err, len(res.body)))
+		client.response_destroy(&res)
+	}
+	{
+		res, err := client.get("https://127.0.0.1:8446/hello", opts)
+		report("https to an IP address certificate", err == nil && res.body == "hello", fmt.tprint(err, res.body))
+		client.response_destroy(&res)
+	}
+	{
+		res, err := client.get("https://localhost:8443/hello")
+		report("https, untrusted CA", err == .TLS_Verification_Failed, fmt.tprint(err))
+		client.response_destroy(&res)
+	}
+	{
+		res, err := client.get("https://alias.test:8443/hello", opts)
+		report("https, certificate for another host", err == .TLS_Verification_Failed, fmt.tprint(err))
+		client.response_destroy(&res)
+	}
+	{
+		// Concurrent requests on this thread's event loop.
+		State :: struct { done, ok: int }
+		s: State
+		N :: 30
+		for i in 0 ..< N {
+			req: client.Request
+			client.request_init(&req, .Get, context.temp_allocator)
+			err := client.request_async(&req, fmt.tprintf("https://localhost:8443/big?size=%i", i * 10_000), opts, &s, proc(res: client.Response, err: client.Error, user_data: rawptr) {
+				s := (^State)(user_data)
+				s.done += 1
+				res := res
+				defer client.response_destroy(&res)
+				if err == nil && bytes.equal(transmute([]byte)res.body, pattern(len(res.body))) { s.ok += 1 }
+			})
+			if err != nil { s.done += 1 }
+		}
+		start := time.tick_now()
+		for s.done < N && time.tick_since(start) < 30 * time.Second { nbio.tick(10 * time.Millisecond) }
+		report("https, 30 concurrent async requests", s.ok == N, fmt.tprintf("%i/%i ok", s.ok, N))
+	}
 }
 
 Run :: struct {

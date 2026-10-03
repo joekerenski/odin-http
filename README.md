@@ -29,7 +29,7 @@ Any other distributions or versions have not been tested and might not work.
 
 ## Dependencies
 
-The *client* package depends on OpenSSL for making HTTPS requests.
+The *client* package depends on OpenSSL 3 for HTTPS (macOS: `brew install openssl@3`).
 
 For Linux, most distros come with OpenSSL, if not you can install it with a package manager, usually under `libssl3`.
 
@@ -168,76 +168,52 @@ post_ping :: proc(req: ^http.Request, res: ^http.Response) {
 
 ## Client example
 
+The client verifies certificates and host names (TLS through the system's OpenSSL, `Opts.tls_ca_file` for a
+private CA), reads responses within limits (`Opts`: 16 MiB bodies, 64 KiB headers, 60s per request by
+default) and validates what it sends. `request`/`get` block; in an HTTP handler use `request_async`, which
+runs on the handler's event loop.
+
 ```odin
 package main
 
 import "core:fmt"
 
-import "../../client"
+import "odin-http/client"
 
 main :: proc() {
-	get()
-	post()
-}
-
-// basic get request.
-get :: proc() {
-	res, err := client.get("https://www.google.com/")
+	res, err := client.get("https://example.com/")
 	if err != nil {
-		fmt.printf("Request failed: %s", err)
+		fmt.println("request failed:", err)
 		return
 	}
 	defer client.response_destroy(&res)
+	fmt.println(res.status, res.headers, res.body)
 
-	fmt.printf("Status: %s\n", res.status)
-	fmt.printf("Headers: %v\n", res.headers)
-	fmt.printf("Cookies: %v\n", res.cookies)
-	body, allocation, berr := client.response_body(&res)
-	if berr != nil {
-		fmt.printf("Error retrieving response body: %s", berr)
-		return
-	}
-	defer client.body_destroy(body, allocation)
-
-	fmt.println(body)
-}
-
-Post_Body :: struct {
-	name:    string,
-	message: string,
-}
-
-// POST request with JSON.
-post :: proc() {
+	// POST with JSON.
 	req: client.Request
 	client.request_init(&req, .Post)
 	defer client.request_destroy(&req)
+	client.with_json(&req, struct{name: string}{"Laytan"})
+	res2, err2 := client.request(&req, "https://example.com/api")
+	if err2 == nil { client.response_destroy(&res2) }
+}
 
-	pbody := Post_Body{"Laytan", "Hello, World!"}
-	if err := client.with_json(&req, pbody); err != nil {
-		fmt.printf("JSON error: %s", err)
-		return
-	}
-
-	res, err := client.request(&req, "https://webhook.site/YOUR-ID-HERE")
-	if err != nil {
-		fmt.printf("Request failed: %s", err)
-		return
-	}
-	defer client.response_destroy(&res)
-
-	fmt.printf("Status: %s\n", res.status)
-	fmt.printf("Headers: %v\n", res.headers)
-	fmt.printf("Cookies: %v\n", res.cookies)
-
-	body, allocation, berr := client.response_body(&res)
-	if berr != nil {
-		fmt.printf("Error retrieving response body: %s", berr)
-		return
-	}
-	defer client.body_destroy(body, allocation)
-
-	fmt.println(body)
+// Inside an HTTP handler: the response arrives on the handler's thread.
+handler :: proc(req: ^http.Request, res: ^http.Response) {
+	r: client.Request
+	client.request_init(&r)
+	defer client.request_destroy(&r)
+	err := client.request_async(&r, "https://example.com/", client.Default_Opts, res, proc(upstream: client.Response, err: client.Error, user_data: rawptr) {
+		res := (^http.Response)(user_data)
+		if err != nil {
+			http.respond(res, http.Status.Bad_Gateway)
+			return
+		}
+		u := upstream
+		defer client.response_destroy(&u)
+		http.respond_plain(res, u.body) // body_set copies
+	})
+	if err != nil { http.respond(res, http.Status.Bad_Gateway) }
 }
 ```
 

@@ -67,6 +67,7 @@ foreign lib {
 	SSL_write :: proc(ssl: ^SSL, buf: [^]byte, num: c.int) -> c.int ---
 	SSL_free :: proc(ssl: ^SSL) ---
 	SSL_CTX_free :: proc(ctx: ^SSL_CTX) ---
+	SSL_CTX_up_ref :: proc(ctx: ^SSL_CTX) -> c.int ---
 	ERR_print_errors_fp :: proc(fp: ^libc.FILE) ---
 	SSL_ctrl :: proc(ssl: ^SSL, cmd: c.int, larg: c.long, parg: rawptr) -> c.long ---
 	OpenSSL_version_num :: proc() -> c.ulong ---

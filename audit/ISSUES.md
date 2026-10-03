@@ -18,11 +18,11 @@ This file is the working checklist. Finding IDs (S/F/C) refer to [REPORT.md](REP
   - All suites run with `ODIN_TEST_FAIL_ON_BAD_MEMORY`: leaks fail the test.
   - `Quarantine` allocator in the harness (zeroes freed memory, never reuses it) turns use-after-free into immediate failures; ASan can't see Odin heap frees.
   - `scripts/test-linux.sh --hunt [RUNS]`: repeat the stress tests until one fails or hangs, with a gdb thread dump on hangs.
-- [ ] **T6** Client test harness: crafted-response server (status, framing, TLS with a local CA, truncation, slow responses).
+- [x] **T6** Client test harness: crafted-response server (status, framing, TLS with a local CA, truncation, slow responses). (`canned_start` in `tests/server/client_test.odin`; TLS with Caddy's local CA in `scripts/interop.sh`.)
 - [x] **T7** Interop: real curl / Python clients against the server; real servers against the client; Caddy in front of the server (docker) for the pooled-connection cases.
   - `scripts/interop.sh`: `tests/interop/server` with curl 8.5, Python's http.client and websockets 10.4, directly and through Caddy 2.11.6 (TLS with its internal CA, HTTP/2 to clients). 36 tests: keep-alive with mixed requests, chunked uploads, `Expect: 100-continue`, 10 MiB bodies, 413 from headers alone, chunked responses, files and ranges, HTTP/1.0, curl connection reuse, 64 concurrent clients, aborted downloads, pooled connections closed by the server's idle timeout, HTTP/2 with 40 parallel streams, WebSocket echo (compressed and not, 5 MiB messages, 2000 pipelined messages, origin check), and spoofed `X-Forwarded-For` against the rate limiter. The server must stay up and shut down cleanly afterwards.
   - Found: concurrent POSTs through Caddy failed about 1 in 50 ("aborting with incomplete response ... use of closed network connection"), with Ubuntu's Caddy 2.6.2 and with 2.11.6. Not the server: the server never closes these connections, and the failures go away with Caddy's `enable_full_duplex` or `request_buffers`. Go's HTTP/1 server drains and closes the request body when the response starts, and the proxy's last read of the request body (looking for EOF) then fails, which tears down the upstream connection mid-response. A fast upstream makes the window reachable. With `request_buffers` the body is wrapped in an `io.MultiReader`, which doesn't read again after EOF. The README's Caddy section recommends `request_buffers`.
-  - Real servers against the clients: the WebSocket client passes Autobahn's fuzzingserver (W8). The HTTP client is untested (Phase 5).
+  - Real servers against the clients: the WebSocket client passes Autobahn's fuzzingserver (W8); both clients run against Caddy over TLS (`tests/interop/client`).
 - [x] **T8** CI: run all of the above on Linux, macOS and Windows; drop the non-compiling examples or fix them (S23). (4336bc3)
   - The GitHub Actions workflow was removed on 2026-10-03 (this copy is macOS/Linux only). Replaced by `scripts/test.sh [--asan]` (macOS/Linux) and `scripts/test-linux.sh [--asan]` (Linux arm64 in docker, io_uring). x86-64 Linux can't be tested on Apple silicon: Rosetta has no io_uring. Running the server in docker needs a seccomp profile that allows io_uring.
 
@@ -115,26 +115,33 @@ This file is the working checklist. Finding IDs (S/F/C) refer to [REPORT.md](REP
 
 ## Phase 5: Client
 
-- [ ] **C1, C7** TLS:
+The client was rewritten on nbio (`client/`): `request_async` on the calling thread's event loop (usable in handlers), `request`/`get` blocking on a thread of their own. Strictly sequential per request (connect, TLS, write, read), so at most one operation is in flight and cleanup happens in one place (`finish`).
+
+- [x] **C1, C7** TLS:
   - Verify peer (`SSL_VERIFY_PEER`), default CA paths, hostname/IP check, SNI without the port.
   - TLS ≥ 1.2, shared `SSL_CTX`.
-  - Explicit `insecure_skip_verify` opt-out.
-- [ ] **C2, C3, C4, C9** Parsing hardening:
-  - Share the strict parsers from Phase 1.
-  - Trailers in a separate map.
-  - Default response size limit with overflow-safe checks.
-  - Header limits.
-  - Fix urlencoded ownership or drop auto-decoding.
-- [ ] **C5, C13, C14, C17** Request construction:
-  - Validate/percent-encode the target.
-  - Validate header names and values and cookies.
-  - Case-insensitive scheme; reject unknown schemes.
+  - ~~Explicit `insecure_skip_verify` opt-out.~~ Deliberately not offered (like `wss://`); `Opts.tls_ca_file` covers private CAs. The setup is shared with the WebSocket client (`openssl/client.odin`).
+- [x] **C2, C3, C4, C9** Parsing hardening:
+  - Share the strict parsers from Phase 1 (Content-Length, chunk sizes, Transfer-Encoding, tokens, field values).
+  - Trailers in a separate map (`Response.trailers`).
+  - Default response size limit with overflow-safe checks (`Opts.max_body_size`, 16 MiB).
+  - Header limits (`max_header_size` 64 KiB for the head and separately the trailers, `max_headers` 100).
+  - ~~Fix urlencoded ownership or~~ drop auto-decoding: the body is a string.
+  - Incremental parser (`client/parser.odin`), tested with every input split several ways (`tests/client`) and fuzzed (`fuzz_client_response`).
+- [x] **C5, C13, C14, C17** Request construction:
+  - Validate/percent-encode the target (bytes that can't appear in a request-target are encoded, existing escapes kept).
+  - Validate header names and values and cookies: invalid ones are refused (`.Invalid_Request`), nothing is escaped. Framing and connection headers can't be set by the caller.
+  - Case-insensitive scheme; reject unknown schemes; user info refused.
   - IP-literal default ports; strip the fragment.
-- [ ] **C6** Connect / read / write / total deadlines in a `Client_Opts`.
-- [ ] **C8, C16** Correct EOF/error mapping for TLS (`SSL_get_error`) and TCP; reject truncated bodies.
-- [ ] **C10, C11** Skip 1xx, no body for HEAD/204/304, accept any 3-digit status, tolerate unknown cookie attributes.
-- [ ] **C12, C15** Resource cleanup on every error path; correct `SSL_write`/`SSL_connect` handling; `SSL_shutdown`.
-- [ ] **A2** Non-blocking client on nbio (connection pooling, keep-alive), to be used by the WebSocket client and to stop blocking event-loop threads.
+- [x] **C6** Connect / read / write / total deadlines in a `Client_Opts`: `Opts.connect_timeout` and `Opts.timeout` (the whole request; every operation gets what's left of it).
+- [x] **C8, C16** Correct EOF/error mapping for TLS (`SSL_get_error`) and TCP; reject truncated bodies (`.Truncated`), an incomplete head is `.Connection_Closed`.
+  - A close-delimited body (no Content-Length, not chunked) over TLS is accepted at TCP EOF even without a close_notify, as browsers and Go do; such a body can be cut short by an attacker on the path without notice.
+- [x] **C10, C11** Skip 1xx (at most 16; 101 is an error), no body for HEAD/204/304, accept any 3-digit status (100-999), tolerate unknown cookie attributes (unparseable Set-Cookie headers are skipped).
+- [x] **C12, C15** Resource cleanup on every error path; correct `SSL_write`/`SSL_connect` handling; ~~`SSL_shutdown`~~ (no close_notify is sent: the connection is closed once the response is complete, `Connection: close` was requested).
+  - When sending fails (a server answering early, e.g. 413, and closing) the response is still read.
+- [x] **A2** Non-blocking client on nbio, to be used by the WebSocket client and to stop blocking event-loop threads.
+- [ ] **C18** Keep-alive and connection pooling: every request opens its own connection (`Connection: close`).
+- Tests: `tests/client` (parser, URLs, request formatting), `client_*` in `tests/server` (against the server: large bodies, chunked, HEAD, 204, cookies, limits, 50 concurrent async requests, `request_async` inside a handler; canned truncated/malformed/slow responses; timeouts, refused connections, TLS to a non-TLS server), and `scripts/interop.sh` (https:// through Caddy: 5 MB downloads, 2 MB uploads, chunked, IP certificate, 30 concurrent requests, untrusted CA and wrong host name refused).
 
 ## Phase 6: Performance
 
