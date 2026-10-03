@@ -15,3 +15,5 @@ bench/static/
 # Autobahn output.
 autobahn/reports/
 autobahn/echo-server
+
+.claude/settings.local.json

@@ -24,14 +24,12 @@ stable version compatibility is not currently a thing.
 
 Because this is still heavily in development, I do not hesitate to push API changes at the moment, so beware.
 
-The package has been tested to work with Ubuntu Linux (other "normal" distros should work), MacOS (m1 and intel), and Windows 64 bit.
+This copy targets macOS and Linux only (the upstream project also supports Windows).
 Any other distributions or versions have not been tested and might not work.
 
 ## Dependencies
 
 The *client* package depends on OpenSSL for making HTTPS requests.
-
-This repository contains a copy of these libraries for ease of use on Windows.
 
 For Linux, most distros come with OpenSSL, if not you can install it with a package manager, usually under `libssl3`.
 
@@ -47,7 +45,6 @@ Other targets are still made to be performant, but benchmarking etc. is mostly d
 
 Although these implementation details are not exposed when using the package, these are the underlying kernel API's that are used.
 
-- Windows: [IOCP (IO Completion Ports)](https://en.wikipedia.org/wiki/Input/output_completion_port)
 - Linux:   [io_uring](https://en.wikipedia.org/wiki/Io_uring)
 - Darwin:  [KQueue](https://en.wikipedia.org/wiki/Kqueue)
 
