@@ -178,6 +178,7 @@ package main
 
 import "core:fmt"
 
+import http "odin-http"
 import "odin-http/client"
 
 main :: proc() {
