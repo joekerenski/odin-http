@@ -98,6 +98,19 @@ http_checks :: proc() {
 		client.response_destroy(&res)
 	}
 	{
+		// Keep-alive over TLS: one connection (and handshake) for consecutive requests.
+		before := client.stats()
+		ok := true
+		for _ in 0 ..< 5 {
+			res, err := client.get("https://localhost:8443/hello", opts)
+			ok &&= err == nil && res.body == "hello"
+			client.response_destroy(&res)
+		}
+		after := client.stats()
+		dials, reused := after.dials - before.dials, after.reused - before.reused
+		report("https keep-alive (5 requests)", ok && dials <= 1 && reused >= 4, fmt.tprintf("ok=%v dials=%i reused=%i", ok, dials, reused))
+	}
+	{
 		// Concurrent requests on this thread's event loop.
 		State :: struct { done, ok: int }
 		s: State

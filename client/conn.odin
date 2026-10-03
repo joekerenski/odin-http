@@ -15,18 +15,29 @@ import "../openssl"
 READ_SIZE :: 32 * 1024
 
 /*
-One request in flight. Strictly sequential: connect, TLS handshake, write the request, read until
-the response is complete. So at most one nbio operation is pending, and `finish` (which frees the
-connection) is only ever called from a completion with nothing else in flight.
+One request in flight. Strictly sequential: connect (or take an idle connection from the pool),
+TLS handshake, write the request, read until the response is complete. So at most one nbio
+operation is pending, and `finish` (which frees the request's state) is only ever called from a
+completion with nothing else in flight.
 */
 Conn :: struct {
 	opts:        Opts,
 	deadline:    time.Time,
 	request:     []byte,
+	method:      http.Method,
 	socket:      net.TCP_Socket,
+	tls:         bool,
 	tls_host:    string,
 	tls_is_ip:   bool,
+	tls_ca_file: string,
 	tls_ctx:     ^openssl.SSL_CTX,
+	port:        int,
+	// The pool's key for the origin, "" without keep-alive.
+	key:         string,
+	// The connection came from the pool (and may turn out to be closed already).
+	reused:      bool,
+	// Some of the response arrived.
+	got_bytes:   bool,
 	// The request couldn't be (fully) written: the server may still have answered (e.g. 413).
 	send_failed: bool,
 
@@ -54,41 +65,16 @@ tick_loop    :: proc() -> nbio.General_Error { return nbio.tick() }
 
 start :: proc(req: ^Request, url: string, opts: Opts, user_data: rawptr, cb: Callback, allocator: mem.Allocator) -> Error {
 	t := parse_url(url, context.temp_allocator) or_return
-
-	endpoint: net.Endpoint
-	if t.is_ip {
-		addr := net.parse_address(t.host)
-		if addr == nil { return .Invalid_URL }
-		endpoint = {addr, t.port}
-	} else {
-		ep4, ep6, err := net.resolve(t.host)
-		if err != nil { return .Resolve_Failed }
-		endpoint = ep4 if ep4 != {} else ep6
-		if endpoint == {} { return .Resolve_Failed }
-		endpoint.port = t.port
-	}
-
-	ctx: ^openssl.SSL_CTX
-	if t.tls {
-		ctx = openssl.client_ctx(opts.tls_ca_file)
-		if ctx == nil {
-			log.warnf("client: TLS setup failed: %s", openssl.error_string())
-			return .TLS_Setup_Failed
-		}
-	}
-
-	request, ferr := format_request(req, t, allocator)
-	if ferr != nil {
-		if ctx != nil { openssl.SSL_CTX_free(ctx) }
-		return ferr
-	}
+	request := format_request(req, t, !opts.disable_keep_alive, allocator) or_return
 
 	c := new(Conn, allocator)
 	c.opts      = opts
 	c.deadline  = time.time_add(nbio.now(), opts.timeout)
 	c.request   = request
-	c.tls_ctx   = ctx
+	c.method    = req.method
+	c.tls       = t.tls
 	c.tls_is_ip = t.is_ip
+	c.port      = t.port
 	c.cb        = cb
 	c.user_data = user_data
 	c.allocator = allocator
@@ -99,16 +85,77 @@ start :: proc(req: ^Request, url: string, opts: Opts, user_data: rawptr, cb: Cal
 	if virtual.arena_init_growing(c.res_arena) != nil {
 		free(c.res_arena, allocator)
 		delete(c.request, allocator)
-		if ctx != nil { openssl.SSL_CTX_free(ctx) }
 		free(c, allocator)
 		return .Network_Error
 	}
 	arena := virtual.arena_allocator(c.res_arena)
-	c.tls_host = clone_string(t.host, arena)
+	c.tls_host    = clone_string(t.host, arena)
+	c.tls_ca_file = clone_string(opts.tls_ca_file, arena)
+	if !opts.disable_keep_alive { c.key = origin_key(t, opts.tls_ca_file, arena) }
 	parser_init(&c.parser, opts, req.method == .Head, arena, allocator)
 
-	nbio.dial_poly(endpoint, c, on_dialed, timeout = min(opts.connect_timeout, time_left(c)))
+	if c.key != "" {
+		if ic, ok := pool_get(c.key); ok {
+			adopt(c, ic)
+			send_request(c)
+			return .None
+		}
+	}
+
+	if err := connect(c); err != nil {
+		virtual.arena_destroy(c.res_arena)
+		free(c.res_arena, allocator)
+		delete(c.parser.body)
+		conn_free(c)
+		return err
+	}
 	return .None
+}
+
+// Resolves the host (blocking), sets up TLS and starts connecting.
+connect :: proc(c: ^Conn) -> Error {
+	endpoint: net.Endpoint
+	if c.tls_is_ip {
+		addr := net.parse_address(c.tls_host)
+		if addr == nil { return .Invalid_URL }
+		endpoint = {addr, c.port}
+	} else {
+		ep4, ep6, err := net.resolve(c.tls_host)
+		if err != nil { return .Resolve_Failed }
+		endpoint = ep4 if ep4 != {} else ep6
+		if endpoint == {} { return .Resolve_Failed }
+		endpoint.port = c.port
+	}
+
+	if c.tls && c.tls_ctx == nil {
+		c.tls_ctx = openssl.client_ctx(c.tls_ca_file)
+		if c.tls_ctx == nil {
+			log.warnf("client: TLS setup failed: %s", openssl.error_string())
+			return .TLS_Setup_Failed
+		}
+	}
+
+	pool_record_dial()
+	nbio.dial_poly(endpoint, c, on_dialed, timeout = min(c.opts.connect_timeout, time_left(c)))
+	return .None
+}
+
+// Takes over an idle connection from the pool.
+adopt :: proc(c: ^Conn, ic: Idle_Conn) {
+	c.reused = true
+	c.socket = ic.socket
+	c.ssl, c.rbio, c.wbio = ic.ssl, ic.rbio, ic.wbio
+	if c.ssl != nil { c.cin = make([]byte, READ_SIZE, c.allocator) }
+}
+
+// Frees the request's state (not the connection's socket and TLS state, see `finish`).
+conn_free :: proc(c: ^Conn) {
+	if c.tls_ctx != nil { openssl.SSL_CTX_free(c.tls_ctx) }
+	delete(c.cin, c.allocator)
+	delete(c.out)
+	delete(c.buf)
+	delete(c.request, c.allocator)
+	free(c, c.allocator)
 }
 
 @(private="file")
@@ -134,7 +181,7 @@ on_dialed :: proc(op: ^nbio.Operation, c: ^Conn) {
 	}
 	c.socket = op.dial.socket
 
-	if c.tls_ctx == nil {
+	if !c.tls {
 		send_request(c)
 		return
 	}
@@ -278,6 +325,7 @@ read_response :: proc(c: ^Conn) {
 			return
 		}
 		non_zero_resize(&c.buf, len(c.buf) + op.recv.received)
+		c.got_bytes = true
 		feed(c)
 	}, timeout = time_left(c))
 }
@@ -298,6 +346,7 @@ read_tls :: proc(c: ^Conn) {
 		}
 		n += int(r)
 	}
+	if n > 0 { c.got_bytes = true }
 	// Reading can make OpenSSL answer (e.g. a key update): write that first.
 	if openssl.drain_bio(c.wbio, &c.out) > 0 && !c.send_failed {
 		if n > 0 { non_zero_resize(&c.buf, len(c.buf) + n) }
@@ -352,11 +401,16 @@ on_eof :: proc(c: ^Conn) {
 	finish(c, err)
 }
 
-// Delivers the response or the error, and frees the connection.
+// Delivers the response or the error. The connection goes back to the pool when it can be reused.
 finish :: proc(c: ^Conn, err: Error) {
+	if err != nil && should_retry(c, err) {
+		retry(c)
+		return
+	}
+
 	res: Response
+	p := &c.parser
 	if err == nil {
-		p := &c.parser
 		p.headers.readonly = true
 		p.trailers.readonly = true
 		res = Response{
@@ -369,21 +423,79 @@ finish :: proc(c: ^Conn, err: Error) {
 			_body      = p.body,
 			_allocator = c.allocator,
 		}
+	}
+
+	if err == nil && reusable(c) {
+		pool_put(c.key, {
+			socket  = c.socket,
+			ssl     = c.ssl,
+			rbio    = c.rbio,
+			wbio    = c.wbio,
+			expires = time.tick_add(time.tick_now(), c.opts.idle_timeout),
+		}, c.opts.max_idle_per_host)
 	} else {
+		close_connection(c)
+	}
+
+	if err != nil {
 		virtual.arena_destroy(c.res_arena)
 		free(c.res_arena, c.allocator)
 		delete(c.parser.body)
 	}
 
-	if c.ssl != nil { openssl.SSL_free(c.ssl) }
-	if c.tls_ctx != nil { openssl.SSL_CTX_free(c.tls_ctx) }
-	if c.socket != 0 { net.close(c.socket) }
-	delete(c.cin, c.allocator)
-	delete(c.out)
-	delete(c.buf)
-	delete(c.request, c.allocator)
-
 	cb, user_data := c.cb, c.user_data
-	free(c, c.allocator)
+	conn_free(c)
 	cb(res, err, user_data)
+}
+
+close_connection :: proc(c: ^Conn) {
+	if c.ssl != nil { openssl.SSL_free(c.ssl) }
+	if c.socket != 0 { net.close(c.socket) }
+	c.ssl, c.rbio, c.wbio, c.socket = nil, nil, nil, 0
+}
+
+/*
+After a complete response, the connection can carry the next request unless: the server said
+`Connection: close`, it's HTTP/1.0, the body ended with the connection, the request wasn't fully
+sent, or anything (plaintext or TLS records) arrived beyond the response.
+*/
+reusable :: proc(c: ^Conn) -> bool {
+	p := &c.parser
+	if c.key == "" || c.send_failed || p.http10 || p.close_delimited || len(c.buf) > 0 { return false }
+	if conn, has := http.headers_get_unsafe(p.headers, "connection"); has && http.header_list_has_token(conn, "close") { return false }
+	if c.ssl != nil && (openssl.SSL_pending(c.ssl) > 0 || openssl.BIO_ctrl_pending(c.rbio) > 0) { return false }
+	return true
+}
+
+/*
+A connection from the pool that turns out to be closed (the server closed it between the
+liveness check and our request) fails before any of the response arrives. Then the request is
+sent again on a new connection, once, if repeating it is safe (an idempotent method, RFC 9110 9.2.2).
+*/
+should_retry :: proc(c: ^Conn, err: Error) -> bool {
+	if !c.reused || c.got_bytes || expired(c) { return false }
+	#partial switch err {
+	case .Connection_Closed, .Network_Error, .TLS_Failed:
+	case:
+		return false
+	}
+	#partial switch c.method {
+	case .Get, .Head, .Put, .Delete, .Options, .Trace:
+		return true
+	}
+	return false
+}
+
+retry :: proc(c: ^Conn) {
+	log.debug("client: reused connection was closed, retrying on a new one")
+	close_connection(c)
+	delete(c.cin, c.allocator)
+	c.cin = nil
+	clear(&c.out)
+	clear(&c.buf)
+	c.reused = false
+	c.send_failed = false
+	if err := connect(c); err != nil {
+		finish(c, err)
+	}
 }

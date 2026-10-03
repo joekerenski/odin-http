@@ -171,3 +171,21 @@ shutdown_with_active_connection :: proc(t: ^testing.T) {
 	server_stop(ts)
 	testing.expectf(t, time.tick_since(start) < 3 * time.Second, "shutdown took %v", time.tick_since(start))
 }
+
+@(test)
+shutdown_with_idle_keepalive_client :: proc(t: ^testing.T) {
+	// A keep-alive client that got its response and stays connected without a word (a pooling
+	// client, a browser): shutdown must not wait for it.
+	testing.set_fail_timeout(t, 20 * time.Second)
+	ts := server_start(t, echo_handler())
+
+	c, _ := raw_dial(ts)
+	defer raw_close(c)
+	raw_send(c, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+	resp, _ := raw_recv(c, 500 * time.Millisecond)
+	testing.expectf(t, status_of(resp) == 200, "%q", resp)
+
+	start := time.tick_now()
+	server_stop(ts)
+	testing.expectf(t, time.tick_since(start) < 3 * time.Second, "shutdown took %v", time.tick_since(start))
+}

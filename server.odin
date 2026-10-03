@@ -328,6 +328,10 @@ _server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
 				hijacked_on_server_shutdown(conn, force && !forced)
 			case .New, .Idle, .Pending:
 				log.debugf("shutdown: closing connection %i", sock)
+				// The connection waits for a request: shutting down the read side too ends that
+				// read, which would otherwise wait for a keep-alive client that stays quiet (and
+				// with it the event loop, which runs until no operation is pending).
+				net.shutdown(sock, .Both)
 				connection_close(conn)
 			case .Closing:
 				log.debugf("shutdown: connection %i is closing", sock)

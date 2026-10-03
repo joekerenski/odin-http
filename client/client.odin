@@ -11,7 +11,8 @@ certificate and host name are always verified).
 handler, or anywhere else an nbio event loop runs, use `request_async`, which runs on the calling
 thread's event loop.
 
-Responses are read completely, within `Opts` limits. One connection per request (no keep-alive).
+Responses are read completely, within `Opts` limits. Connections are reused (keep-alive) unless
+`Opts.disable_keep_alive` is set.
 */
 package client
 
@@ -40,6 +41,14 @@ Opts :: struct {
 	// https://: a PEM file with the CA certificates to trust instead of the system's (e.g. a
 	// private CA). Verification can't be turned off.
 	tls_ca_file:     string,
+
+	// Connections are kept open after a request and reused for the next one to the same origin
+	// (see pool.odin), unless this is set.
+	disable_keep_alive: bool,
+	// How long an idle connection is kept, defaults to 30s (servers often close theirs after a
+	// minute or more). How many are kept per origin, defaults to 4.
+	idle_timeout:       time.Duration,
+	max_idle_per_host:  int,
 }
 
 Default_Opts :: Opts{
@@ -48,6 +57,8 @@ Default_Opts :: Opts{
 	max_header_size = 64 * mem.Kilobyte,
 	max_headers     = 100,
 	max_body_size   = 16 * mem.Megabyte,
+	idle_timeout    = 30 * time.Second,
+	max_idle_per_host = 4,
 }
 
 Error :: enum u8 {
@@ -218,6 +229,8 @@ with_defaults :: proc(opts: Opts) -> Opts {
 	if o.max_header_size <= 0 { o.max_header_size = Default_Opts.max_header_size }
 	if o.max_headers <= 0     { o.max_headers     = Default_Opts.max_headers }
 	if o.max_body_size <= 0   { o.max_body_size   = Default_Opts.max_body_size }
+	if o.idle_timeout <= 0    { o.idle_timeout    = Default_Opts.idle_timeout }
+	if o.max_idle_per_host <= 0 { o.max_idle_per_host = Default_Opts.max_idle_per_host }
 	return o
 }
 
@@ -227,11 +240,11 @@ RESERVED_HEADERS :: [?]string{"content-length", "transfer-encoding", "connection
 
 /*
 The request as sent: request line, headers (Host, User-Agent and Accept unless set, Connection:
-close, Content-Length when there is a body or the method expects one), cookies, body. Header names
-must be tokens and values field-content, cookies must be valid: nothing is escaped, an invalid
-request is refused.
+close unless `keep_alive`, Content-Length when there is a body or the method expects one), cookies,
+body. Header names must be tokens and values field-content, cookies must be valid: nothing is
+escaped, an invalid request is refused.
 */
-format_request :: proc(req: ^Request, t: Target, allocator := context.allocator) -> (out: []byte, err: Error) {
+format_request :: proc(req: ^Request, t: Target, keep_alive := false, allocator := context.allocator) -> (out: []byte, err: Error) {
 	sb := strings.builder_make(0, bytes.buffer_length(&req.body) + 256, allocator)
 	defer if err != nil { strings.builder_destroy(&sb) }
 
@@ -258,7 +271,7 @@ format_request :: proc(req: ^Request, t: Target, allocator := context.allocator)
 	if _, has := http.headers_get(req.headers, "accept"); !has {
 		strings.write_string(&sb, "accept: */*\r\n")
 	}
-	strings.write_string(&sb, "connection: close\r\n")
+	if !keep_alive { strings.write_string(&sb, "connection: close\r\n") }
 
 	body_len := bytes.buffer_length(&req.body)
 	if body_len > 0 || req.method == .Post || req.method == .Put || req.method == .Patch {

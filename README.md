@@ -170,8 +170,9 @@ post_ping :: proc(req: ^http.Request, res: ^http.Response) {
 
 The client verifies certificates and host names (TLS through the system's OpenSSL, `Opts.tls_ca_file` for a
 private CA), reads responses within limits (`Opts`: 16 MiB bodies, 64 KiB headers, 60s per request by
-default) and validates what it sends. `request`/`get` block; in an HTTP handler use `request_async`, which
-runs on the handler's event loop.
+default) and validates what it sends. Connections are kept alive and reused per origin (`Opts.idle_timeout`,
+`max_idle_per_host`, `disable_keep_alive`). `request`/`get` block; in an HTTP handler use `request_async`,
+which runs on the handler's event loop.
 
 ```odin
 package main

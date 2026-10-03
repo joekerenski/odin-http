@@ -45,6 +45,9 @@ Parser :: struct {
 
 	// Result.
 	status:          int,
+	// HTTP/1.0 response (no persistent connection), and whether the body ended with the connection.
+	http10:          bool,
+	close_delimited: bool,
 	headers:         http.Headers,
 	trailers:        http.Headers,
 	cookies:         [dynamic]http.Cookie,
@@ -140,7 +143,7 @@ parse_line :: proc(p: ^Parser, line: string, raw_len: int) -> Error {
 		if p.section_bytes > p.max_header_size { return .Response_Too_Large }
 		// Tolerate empty lines before the status line (RFC 9112 2.2); they count against the limit.
 		if line == "" { return .None }
-		p.status = parse_status_line(line) or_return
+		p.status, p.http10 = parse_status_line(line) or_return
 		p.state = .Headers
 
 	case .Headers, .Trailers:
@@ -182,17 +185,17 @@ parse_line :: proc(p: ^Parser, line: string, raw_len: int) -> Error {
 // status-line = HTTP-version SP 3DIGIT SP [ reason-phrase ]; the SP before an empty reason is
 // often left out and accepted.
 @(private)
-parse_status_line :: proc(line: string) -> (status: int, err: Error) {
-	if len(line) < 12 || line[8] != ' ' { return 0, .Invalid_Response }
+parse_status_line :: proc(line: string) -> (status: int, http10: bool, err: Error) {
+	if len(line) < 12 || line[8] != ' ' { return 0, false, .Invalid_Response }
 	version, ok := http.parse_http_version(line[:8])
-	if !ok || version.major != 1 { return 0, .Invalid_Response }
+	if !ok || version.major != 1 { return 0, false, .Invalid_Response }
 	for i in 9 ..< 12 {
-		if line[i] < '0' || line[i] > '9' { return 0, .Invalid_Response }
+		if line[i] < '0' || line[i] > '9' { return 0, false, .Invalid_Response }
 		status = status * 10 + int(line[i] - '0')
 	}
-	if status < 100 { return 0, .Invalid_Response }
-	if len(line) > 12 && (line[12] != ' ' || !http.is_field_value(line[13:])) { return 0, .Invalid_Response }
-	return status, .None
+	if status < 100 { return 0, false, .Invalid_Response }
+	if len(line) > 12 && (line[12] != ' ' || !http.is_field_value(line[13:])) { return 0, false, .Invalid_Response }
+	return status, version.minor == 0, .None
 }
 
 @(private)
@@ -266,5 +269,6 @@ headers_done :: proc(p: ^Parser) -> Error {
 	}
 
 	p.state = .Body_Close
+	p.close_delimited = true
 	return .None
 }

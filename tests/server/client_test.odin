@@ -326,3 +326,169 @@ client_timeouts_and_failures :: proc(t: ^testing.T) {
 		client.response_destroy(&res)
 	}
 }
+
+// --- Keep-alive ---
+
+// Answers with the client's port, so the test sees which connection a request came on.
+@(private="file")
+port_handler :: proc() -> http.Handler {
+	return http.handler(proc(req: ^http.Request, res: ^http.Response) {
+		if req.url.path == "/close" { http.headers_set_close(&res.headers) }
+		http.respond_plain(res, fmt.tprint(req.client.port))
+	})
+}
+
+@(private="file")
+port_of :: proc(t: ^testing.T, url: string, opts := client.Default_Opts, loc := #caller_location) -> string {
+	res, err := client.get(url, opts)
+	defer client.response_destroy(&res)
+	testing.expectf(t, err == nil && res.status == .OK, "%s: %v %v", url, err, res.status, loc = loc)
+	return strings.clone(res.body, context.temp_allocator)
+}
+
+@(test)
+client_keep_alive :: proc(t: ^testing.T) {
+	testing.set_fail_timeout(t, 60 * time.Second)
+	q: Quarantine
+	context.allocator = quarantine_allocator(&q)
+	opts := http.Default_Server_Opts
+	opts.idle_timeout = 300 * time.Millisecond
+	ts := server_start(t, port_handler(), opts)
+	defer server_stop(ts)
+	url := fmt.tprintf("http://127.0.0.1:%i/", ts.port)
+
+	// One connection for consecutive requests.
+	first := port_of(t, url)
+	for _ in 0 ..< 5 {
+		p := port_of(t, url)
+		testing.expectf(t, p == first, "new connection: %s, then %s", first, p)
+	}
+
+	// Not reused after Connection: close, nor without keep-alive.
+	closing := port_of(t, fmt.tprintf("http://127.0.0.1:%i/close", ts.port))
+	testing.expectf(t, port_of(t, url) != closing, "reused a connection the server closed")
+	a := port_of(t, url, {disable_keep_alive = true})
+	b := port_of(t, url, {disable_keep_alive = true})
+	testing.expect(t, a != b)
+
+	// The server closed it after its idle timeout: noticed, and a new connection is used, no error.
+	before := port_of(t, url)
+	time.sleep(800 * time.Millisecond)
+	after := port_of(t, url)
+	testing.expectf(t, before != after, "kept using %s after the server closed it", before)
+
+	// Requests on an event loop share the pool too.
+	{
+		nbio.acquire_thread_event_loop()
+		defer nbio.release_thread_event_loop()
+		ports: [dynamic]string
+		ports.allocator = context.temp_allocator
+		for _ in 0 ..< 3 {
+			done := false
+			r: client.Request
+			client.request_init(&r, .Get, context.temp_allocator)
+			State :: struct { done: ^bool, ports: ^[dynamic]string }
+			s := State{&done, &ports}
+			client.request_async(&r, url, client.Default_Opts, &s, proc(res: client.Response, err: client.Error, user_data: rawptr) {
+				s := (^State)(user_data)
+				res := res
+				append(s.ports, strings.clone(res.body, context.temp_allocator))
+				client.response_destroy(&res)
+				s.done^ = true
+			})
+			for !done { nbio.tick(10 * time.Millisecond) }
+		}
+		testing.expectf(t, len(ports) == 3 && ports[0] == ports[1] && ports[1] == ports[2], "%v", ports)
+	}
+}
+
+/*
+A server whose first connection answers one request, then closes as soon as the next one arrives
+(the race a liveness check can't catch: the server's idle timeout firing just as the request goes
+out). Later connections answer normally.
+*/
+@(private="file")
+Flaky :: struct {
+	sock:        net.TCP_Socket,
+	port:        int,
+	connections: int,
+	thread:      ^thread.Thread,
+}
+
+@(private="file")
+flaky_start :: proc(conns: int) -> ^Flaky {
+	f := new(Flaky)
+	f.sock, _ = net.listen_tcp({net.IP4_Loopback, 0})
+	ep, _ := net.bound_endpoint(f.sock)
+	f.port = ep.port
+	net.set_option(f.sock, .Receive_Timeout, 5 * time.Second)
+	f.connections = conns
+	f.thread = thread.create_and_start_with_poly_data(f, proc(f: ^Flaky) {
+		read_head :: proc(conn: net.TCP_Socket) -> bool {
+			head: [dynamic]byte
+			defer delete(head)
+			buf: [4096]byte
+			for !strings.contains(string(head[:]), "\r\n\r\n") {
+				n, err := net.recv_tcp(conn, buf[:])
+				if err != nil || n == 0 { return false }
+				append(&head, ..buf[:n])
+			}
+			return true
+		}
+		OK :: "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
+		for i in 0 ..< f.connections {
+			conn, _, err := net.accept_tcp(f.sock)
+			if err != nil { return }
+			net.set_option(conn, .Receive_Timeout, 3 * time.Second)
+			if read_head(conn) { net.send_tcp(conn, transmute([]byte)string(OK)) }
+			// The first connection: close when the next request arrives, without answering.
+			if i == 0 { read_head(conn) }
+			net.close(conn)
+		}
+	}, context)
+	return f
+}
+
+@(private="file")
+flaky_stop :: proc(f: ^Flaky) {
+	net.close(f.sock)
+	thread.join(f.thread)
+	thread.destroy(f.thread)
+	free(f)
+}
+
+@(test)
+client_keep_alive_retry :: proc(t: ^testing.T) {
+	testing.set_fail_timeout(t, 60 * time.Second)
+	q: Quarantine
+	context.allocator = quarantine_allocator(&q)
+
+	// GET is repeated on a new connection.
+	{
+		f := flaky_start(2)
+		url := fmt.tprintf("http://127.0.0.1:%i/", f.port)
+		for i in 0 ..< 2 {
+			res, err := client.get(url)
+			testing.expectf(t, err == nil && res.body == "ok", "request %i: %v %q", i, err, res.body)
+			client.response_destroy(&res)
+		}
+		flaky_stop(f)
+	}
+
+	// POST isn't: the server may have acted on it.
+	{
+		f := flaky_start(1)
+		url := fmt.tprintf("http://127.0.0.1:%i/", f.port)
+		res, err := client.get(url)
+		testing.expect(t, err == nil)
+		client.response_destroy(&res)
+
+		r: client.Request
+		client.request_init(&r, .Post, context.temp_allocator)
+		bytes.buffer_write_string(&r.body, "data")
+		res, err = client.request(&r, url)
+		testing.expectf(t, err == .Connection_Closed || err == .Network_Error, "POST on a dropped connection: %v", err)
+		client.response_destroy(&res)
+		flaky_stop(f)
+	}
+}

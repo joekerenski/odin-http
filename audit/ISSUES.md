@@ -115,7 +115,7 @@ This file is the working checklist. Finding IDs (S/F/C) refer to [REPORT.md](REP
 
 ## Phase 5: Client
 
-The client was rewritten on nbio (`client/`): `request_async` on the calling thread's event loop (usable in handlers), `request`/`get` blocking on a thread of their own. Strictly sequential per request (connect, TLS, write, read), so at most one operation is in flight and cleanup happens in one place (`finish`).
+The client was rewritten on nbio (`client/`): `request_async` on the calling thread's event loop (usable in handlers), `request`/`get` blocking on a thread of their own. Strictly sequential per request (connect or take a pooled connection, TLS, write, read), so at most one operation is in flight and cleanup happens in one place (`finish`).
 
 - [x] **C1, C7** TLS:
   - Verify peer (`SSL_VERIFY_PEER`), default CA paths, hostname/IP check, SNI without the port.
@@ -137,10 +137,15 @@ The client was rewritten on nbio (`client/`): `request_async` on the calling thr
 - [x] **C8, C16** Correct EOF/error mapping for TLS (`SSL_get_error`) and TCP; reject truncated bodies (`.Truncated`), an incomplete head is `.Connection_Closed`.
   - A close-delimited body (no Content-Length, not chunked) over TLS is accepted at TCP EOF even without a close_notify, as browsers and Go do; such a body can be cut short by an attacker on the path without notice.
 - [x] **C10, C11** Skip 1xx (at most 16; 101 is an error), no body for HEAD/204/304, accept any 3-digit status (100-999), tolerate unknown cookie attributes (unparseable Set-Cookie headers are skipped).
-- [x] **C12, C15** Resource cleanup on every error path; correct `SSL_write`/`SSL_connect` handling; ~~`SSL_shutdown`~~ (no close_notify is sent: the connection is closed once the response is complete, `Connection: close` was requested).
+- [x] **C12, C15** Resource cleanup on every error path; correct `SSL_write`/`SSL_connect` handling; ~~`SSL_shutdown`~~ (no close_notify is sent when a connection is closed).
   - When sending fails (a server answering early, e.g. 413, and closing) the response is still read.
 - [x] **A2** Non-blocking client on nbio, to be used by the WebSocket client and to stop blocking event-loop threads.
-- [ ] **C18** Keep-alive and connection pooling: every request opens its own connection (`Connection: close`).
+- [x] **C18** Keep-alive and connection pooling (`client/pool.odin`):
+  - One pool for the process, by origin (scheme, host, port, CA file), shared by all threads: a connection is only in the pool while nothing is in flight on it, and nbio keeps no per-socket state between operations (one-shot kqueue filters, io_uring), so any event loop can take it. The blocking `request` (a thread per call) benefits as much as `request_async`.
+  - Reused only after a complete HTTP/1.1 response framed by Content-Length or chunked, without `Connection: close`, with nothing (plaintext or TLS records) left over. LIFO; `Opts.idle_timeout` (30s), `Opts.max_idle_per_host` (4), 64 in total; `Opts.disable_keep_alive`; `close_idle_connections()`.
+  - Before reuse a `poll` with zero timeout: a readable idle connection (closed by the server, or something unexpected arrived) is dropped. If a reused connection still fails before any of the response arrived (the server closed it as the request went out), an idempotent request (GET, HEAD, PUT, DELETE, OPTIONS, TRACE) is repeated once on a new connection; others (POST, PATCH) report the error, as the server may have acted on them.
+  - Found on the way, in the server: shutting down with an idle keep-alive client that stays connected hung forever (the pending read for the next request never completed, and the event loop runs until nothing is pending). Idle connections are now shut down in both directions at shutdown. Test: `shutdown_with_idle_keepalive_client` (hangs without the fix).
+  - Tests: `client_keep_alive` (consecutive and async requests on one connection, not reused after `Connection: close` or with keep-alive off, a connection closed by the server's idle timeout replaced without an error), `client_keep_alive_retry` (a server dropping the connection when the next request arrives: GET retried, POST reports it), and over TLS through Caddy in `scripts/interop.sh` (5 requests, 1 connection).
 - Tests: `tests/client` (parser, URLs, request formatting), `client_*` in `tests/server` (against the server: large bodies, chunked, HEAD, 204, cookies, limits, 50 concurrent async requests, `request_async` inside a handler; canned truncated/malformed/slow responses; timeouts, refused connections, TLS to a non-TLS server), and `scripts/interop.sh` (https:// through Caddy: 5 MB downloads, 2 MB uploads, chunked, IP certificate, 30 concurrent requests, untrusted CA and wrong host name refused).
 
 ## Phase 6: Performance

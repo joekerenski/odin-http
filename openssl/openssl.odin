@@ -94,6 +94,7 @@ foreign lib {
 	SSL_set_connect_state :: proc(ssl: ^SSL) ---
 	SSL_do_handshake :: proc(ssl: ^SSL) -> c.int ---
 	SSL_shutdown :: proc(ssl: ^SSL) -> c.int ---
+	SSL_pending :: proc(ssl: ^SSL) -> c.int ---
 
 	ERR_get_error :: proc() -> c.ulong ---
 	ERR_clear_error :: proc() ---
