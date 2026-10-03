@@ -18,3 +18,4 @@ autobahn/echo-server
 
 .claude/settings.local.json
 .hunt-bt.txt
+autobahn/echo-client

@@ -27,6 +27,7 @@ main :: proc() {
 			send_queue_limit = 256 * mem.Megabyte,
 			ping_interval    = -1,
 			check_origin     = ws.allow_any_origin,
+			compression      = true,
 		}
 		ws.upgrade(req, res, opts, {
 			on_message = proc(c: ^ws.Conn, kind: ws.Message_Kind, data: []byte) {

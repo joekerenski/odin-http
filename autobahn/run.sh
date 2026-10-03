@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs the Autobahn TestSuite (fuzzingclient) against the echo server in autobahn/server.
-# Needs docker. Cases 12/13 (permessage-deflate) are excluded until W9.
+# Needs docker. Runs every case, 12/13 with permessage-deflate.
 # Usage: autobahn/run.sh [case-glob ...]   e.g. autobahn/run.sh '9.*'
 # Report: autobahn/reports/index.html, summary printed at the end.
 set -euo pipefail

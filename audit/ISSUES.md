@@ -86,10 +86,13 @@ This file is the working checklist. Finding IDs (S/F/C) refer to [REPORT.md](REP
 - [x] **W4** Close handshake: status code validation, close-reason UTF-8, timeouts for the peer's close, TCP close ordering. (2ca5a6f)
 - [x] **W5** Ping/pong: auto-pong, optional keepalive pings with a dead-peer timeout; idle timeout. (2ca5a6f)
 - [ ] **W6** Send path: bounded per-connection send queue with backpressure signal (`send` returns a full/queued status), zero-copy writes where possible, broadcast helper across threads (`nbio.exec` onto the owning loop).
-- [ ] **W7** Client side (`websocket.dial`) over the hardened client, with masking from a CSPRNG.
-- [ ] **W8** Autobahn TestSuite (fuzzingclient against our server, fuzzingserver against our client) in docker: 100% pass on cases 1-11 (non-compression), informational cases reviewed.
-  - Server side done: `autobahn/run.sh`. 296 OK, 0 failed; 6.4.3/6.4.4 NON-STRICT (invalid UTF-8 is detected once the whole frame has arrived, not mid-frame); 7.1.6/7.13.x informational. Case 9 (performance) shows nothing slow. Fixed 2.10 (pongs were sent in reverse order). Client side waits for W7.
-- [ ] **W9** `permessage-deflate` (RFC 7692) via `vendor:zlib`, with decompression-bomb limits; Autobahn 12-13.
+- [x] **W7** Client side (`websocket.dial`) over the hardened client, with masking from a CSPRNG.
+  - Built on nbio directly (the HTTP client is blocking and not hardened yet), sharing the connection code with the server (`conn.odin`). `ws://` only: TLS on the event loop is out of scope. Masks from `crypto.rand_bytes` in batches; the client waits for the server to close TCP after the close handshake (RFC 6455 7.1.1). Tests: `ws_client_echo` (quarantine allocator), `ws_client_handshake_failures`, compressed client sessions in `stress_websocket`.
+- [x] **W8** Autobahn TestSuite (fuzzingclient against our server, fuzzingserver against our client) in docker: 100% pass on cases 1-11 (non-compression), informational cases reviewed.
+  - Server side done: `autobahn/run.sh`. 296 OK, 0 failed; 6.4.3/6.4.4 NON-STRICT (invalid UTF-8 is detected once the whole frame has arrived, not mid-frame); 7.1.6/7.13.x informational. Case 9 (performance) shows nothing slow. Fixed 2.10 (pongs were sent in reverse order). Client side: `autobahn/run-client.sh`.
+  - 2026-10-03, with compression: server 517/517 and client 517/517 (512 OK, 2 NON-STRICT, 3 informational, 0 failed on both sides).
+- [x] **W9** `permessage-deflate` (RFC 7692) via `vendor:zlib`, with decompression-bomb limits; Autobahn 12-13.
+  - Opt-in (`Opts.compression`, ~300KiB zlib state per connection). Offers asking for an 8-bit window are declined (zlib can't compress with 256 bytes). Decompression is capped at `max_message_size` (1009) and text is validated while it's decompressed. Messages under 32 bytes go uncompressed. Tests: negotiation unit tests, `ws_compression_bomb`.
 
 ## Found by the stress tests (2026-10-03)
 

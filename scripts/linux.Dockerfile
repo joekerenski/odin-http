@@ -21,5 +21,5 @@ RUN git clone --filter=blob:none https://github.com/odin-lang/Odin /opt/odin \
 
 WORKDIR /src
 
-# For thread dumps of hung tests (gdb -p PID -batch -ex "thread apply all bt").
-RUN apt-get update && apt-get install -y --no-install-recommends gdb && rm -rf /var/lib/apt/lists/*
+# gdb for thread dumps of hung tests (gdb -p PID -batch -ex "thread apply all bt"), zlib for permessage-deflate.
+RUN apt-get update && apt-get install -y --no-install-recommends gdb zlib1g-dev && rm -rf /var/lib/apt/lists/*

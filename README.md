@@ -33,6 +33,8 @@ The *client* package depends on OpenSSL for making HTTPS requests.
 
 For Linux, most distros come with OpenSSL, if not you can install it with a package manager, usually under `libssl3`.
 
+The *websocket* package links the system zlib for compression (`permessage-deflate`), on Linux usually `zlib1g-dev` / `zlib-devel`.
+
 ## Performance
 
 Some small benchmarks have been done in the comparisons directory.
@@ -228,4 +230,39 @@ post :: proc() {
 
 	fmt.println(body)
 }
+```
+
+## WebSockets
+
+The `websocket` package (RFC 6455, with `permessage-deflate` from RFC 7692) has a server side, upgrading
+a request inside any handler, and a client (`ws://` only). Both pass the full
+[Autobahn TestSuite](https://github.com/crossbario/autobahn-testsuite) (`autobahn/run.sh`, `autobahn/run-client.sh`).
+
+```odin
+import ws "odin-http/websocket"
+
+// Server: inside an HTTP handler.
+ws.upgrade(req, res, {compression = true}, {
+	on_message = proc(c: ^ws.Conn, kind: ws.Message_Kind, data: []byte) {
+		ws.send(c, kind, data) // echo
+	},
+})
+
+// Client: on a thread with an nbio event loop (e.g. a server thread).
+ws.dial("ws://localhost:8080/chat", {opts = {compression = true}}, {
+	on_open    = proc(c: ^ws.Conn) { ws.send_text(c, "hello") },
+	on_message = proc(c: ^ws.Conn, kind: ws.Message_Kind, data: []byte) {},
+	on_close   = proc(c: ^ws.Conn, code: u16, reason: string) {},
+})
+```
+
+Connections live on one event loop thread; use `ws.handle(c)` with `ws.send_from_any_thread` / `ws.broadcast`
+from other threads.
+
+## Tests
+
+```sh
+scripts/test.sh [--asan]                     # all suites (macOS / Linux)
+scripts/test-linux.sh [--asan] [--stress 5]  # Linux (io_uring) in docker, capped at 2 CPUs
+scripts/test-linux.sh --hunt 40              # repeat the stress tests until one fails, with thread dumps
 ```

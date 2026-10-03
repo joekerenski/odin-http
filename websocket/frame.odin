@@ -31,6 +31,9 @@ Frame_Header :: struct {
 // Largest possible header: 2 + 8 (64-bit length) + 4 (mask).
 MAX_HEADER_SIZE :: 14
 
+// RSV1 in `Frame_Header.rsv`: the message is compressed (permessage-deflate).
+RSV1 :: 0b100
+
 Parse_Result :: enum {
 	Ok,
 	// Not enough bytes for the whole header yet.
@@ -40,8 +43,9 @@ Parse_Result :: enum {
 }
 
 // Parses a frame header at the start of `buf`. `require_mask` is true on the server side (client
-// frames must be masked), false on the client side (server frames must not be).
-parse_header :: proc "contextless" (buf: []byte, require_mask: bool) -> (h: Frame_Header, header_len: int, res: Parse_Result) {
+// frames must be masked), false on the client side (server frames must not be). `allowed_rsv` are
+// the RSV bits an extension negotiated (`RSV1` for compression), others are a protocol error.
+parse_header :: proc "contextless" (buf: []byte, require_mask: bool, allowed_rsv: u8 = 0) -> (h: Frame_Header, header_len: int, res: Parse_Result) {
 	if len(buf) < 2 { return {}, 0, .Need_More }
 
 	b0, b1 := buf[0], buf[1]
@@ -54,8 +58,8 @@ parse_header :: proc "contextless" (buf: []byte, require_mask: bool) -> (h: Fram
 	case:                              return {}, 0, .Protocol_Error // Reserved opcodes.
 	}
 
-	// No extensions are negotiated, so RSV bits must be 0.
-	if h.rsv != 0 { return {}, 0, .Protocol_Error }
+	// RSV bits are only allowed when an extension negotiated them.
+	if h.rsv & ~allowed_rsv != 0 { return {}, 0, .Protocol_Error }
 	if h.masked != require_mask { return {}, 0, .Protocol_Error }
 
 	n := 2
@@ -93,8 +97,8 @@ parse_header :: proc "contextless" (buf: []byte, require_mask: bool) -> (h: Fram
 
 // Writes a frame header into `buf` (which must have room for MAX_HEADER_SIZE bytes) and returns
 // the used part. A mask is written when `mask` is non-nil.
-write_header :: proc "contextless" (buf: []byte, fin: bool, opcode: Opcode, payload_len: int, mask: Maybe([4]byte) = nil) -> []byte {
-	buf[0] = u8(opcode) | (0x80 if fin else 0)
+write_header :: proc "contextless" (buf: []byte, fin: bool, opcode: Opcode, payload_len: int, mask: Maybe([4]byte) = nil, rsv: u8 = 0) -> []byte {
+	buf[0] = u8(opcode) | (0x80 if fin else 0) | (rsv & 0x7) << 4
 	mask_bit: u8 = 0x80 if mask != nil else 0
 	n := 2
 	switch {

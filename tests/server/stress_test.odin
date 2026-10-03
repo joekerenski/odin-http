@@ -10,6 +10,7 @@ package tests_server
 // the container's CPU and memory and kills steps that run too long or log too much.
 // Heavier runs: -define:STRESS_SERVER_THREADS=4 -define:STRESS_WORKERS=12.
 
+import "core:fmt"
 import "core:io"
 import "core:log"
 import "core:math/rand"
@@ -160,7 +161,8 @@ stress_handler :: proc(s: ^Stress) -> http.Handler {
 				io.write_string(w, "body")
 				io.close(w)
 			case "/ws":
-				ws.upgrade(req, res, {max_message_size = 1 << 20, ping_interval = -1}, {
+				// Compression for the clients that offer it (ws_client_session), not for the raw ones.
+				ws.upgrade(req, res, {max_message_size = 1 << 20, ping_interval = -1, compression = true}, {
 					user_data = h.user_data,
 					on_open = proc(c: ^ws.Conn) {
 						s := (^Stress)(c.user_data)
@@ -501,6 +503,68 @@ ws_session :: proc(s: ^Stress) {
 	}
 }
 
+// A session with our own client (websocket.dial), with compression, on this thread's event loop.
+@(private="file")
+ws_client_session :: proc(s: ^Stress) {
+	Session :: struct {
+		s:      ^Stress,
+		msgs:   [][]byte,
+		got:    int,
+		done:   bool,
+		failed: bool,
+	}
+
+	nbio.acquire_thread_event_loop()
+	defer nbio.release_thread_event_loop()
+
+	sess := Session{s = s, msgs = make([][]byte, 1 + rand.int_max(6), context.temp_allocator)}
+	for &m in sess.msgs {
+		size := rand.int_max(300) if rand.int_max(5) > 0 else rand.int_max(70000)
+		m = transmute([]byte)strings.concatenate({"m", random_text(size)}, context.temp_allocator)
+	}
+
+	url := fmt.tprintf("ws://127.0.0.1:%i/ws", s.port)
+	_, err := ws.dial(url, {opts = {compression = true, max_message_size = 1 << 20}}, {
+		user_data = &sess,
+		on_open = proc(c: ^ws.Conn) {
+			sess := (^Session)(c.user_data)
+			if !c.compressed { fail(sess.s, "ws client: compression not negotiated") }
+			for m in sess.msgs { ws.send(c, .Text, m) }
+		},
+		on_message = proc(c: ^ws.Conn, kind: ws.Message_Kind, data: []byte) {
+			sess := (^Session)(c.user_data)
+			if string(data) == "bcast" { return }
+			if sess.got >= len(sess.msgs) || string(data) != string(sess.msgs[sess.got]) {
+				fail(sess.s, "ws client: echo %i mismatch (%i bytes)", sess.got, len(data))
+				sess.failed = true
+				ws.close(c)
+				return
+			}
+			sess.got += 1
+			sync.atomic_add(&sess.s.exchanges, 1)
+			if sess.got == len(sess.msgs) { ws.close(c) }
+		},
+		on_close = proc(c: ^ws.Conn, code: u16, reason: string) {
+			sess := (^Session)(c.user_data)
+			sess.done = true
+			// 1001: the broadcaster closed it, a fine ending too.
+			if !sess.failed && code != 1000 && code != 1001 {
+				fail(sess.s, "ws client: closed with %v (%s) after %i/%i echoes", code, reason, sess.got, len(sess.msgs))
+			}
+		},
+	})
+	if err != nil {
+		fail(s, "ws client: dial: %v", err)
+		return
+	}
+
+	start := time.tick_now()
+	for !sess.done && time.tick_since(start) < 10 * time.Second {
+		nbio.tick(10 * time.Millisecond)
+	}
+	if !sess.done { fail(s, "ws client: session didn't finish in 10s") }
+}
+
 // Broadcasts to every open WebSocket connection from another thread and sometimes closes one.
 @(private="file")
 broadcaster :: proc(s: ^Stress) {
@@ -553,6 +617,7 @@ stress_websocket :: proc(t: ^testing.T) {
 	threads := make([dynamic]^thread.Thread)
 	defer delete(threads)
 	run_workers(&s, WS_WORKERS, ws_session, &threads)
+	run_workers(&s, max(WS_WORKERS / 2, 1), ws_client_session, &threads)
 	run_workers(&s, 1, broadcaster, &threads)
 	time.sleep(STRESS_SECONDS * time.Second)
 	sync.atomic_store(&s.stop, true)
