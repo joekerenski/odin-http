@@ -33,7 +33,8 @@ The *client* package depends on OpenSSL for making HTTPS requests.
 
 For Linux, most distros come with OpenSSL, if not you can install it with a package manager, usually under `libssl3`.
 
-The *websocket* package links the system zlib for compression (`permessage-deflate`), on Linux usually `zlib1g-dev` / `zlib-devel`.
+The *websocket* package links the system zlib for compression (`permessage-deflate`), on Linux usually `zlib1g-dev` / `zlib-devel`,
+and OpenSSL 3 for `wss://` (macOS: `brew install openssl@3`).
 
 ## Performance
 
@@ -243,7 +244,8 @@ post :: proc() {
 ## WebSockets
 
 The `websocket` package (RFC 6455, with `permessage-deflate` from RFC 7692) has a server side, upgrading
-a request inside any handler, and a client (`ws://` only). Both pass the full
+a request inside any handler, and a client (`ws://` and `wss://`; TLS through the system OpenSSL, the server's
+certificate and host name are always verified, `Dial_Opts.tls_ca_file` for a private CA). Both pass the full
 [Autobahn TestSuite](https://github.com/crossbario/autobahn-testsuite) (`autobahn/run.sh`, `autobahn/run-client.sh`).
 
 ```odin

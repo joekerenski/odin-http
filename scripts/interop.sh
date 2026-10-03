@@ -23,6 +23,9 @@ docker run --rm --cpus="${CPUS:-2}" --memory=2g --pids-limit=512 -e PYTHONDONTWR
 	-v "$PWD:/src" "$IMAGE" timeout -s KILL 600 bash -c "
 	set -u
 	odin build tests/interop/server -o:speed -out:/tmp/interop || exit 1
+	odin build tests/interop/client -o:speed -out:/tmp/interop-client || exit 1
+	# For the client's host name check, see tests/interop/client.
+	echo '127.0.0.1 alias.test' >> /etc/hosts
 	head -c 3000000 /dev/urandom > /tmp/file.bin
 
 	/tmp/interop 8080 /tmp/file.bin > /tmp/server.log 2>&1 & srv=\$!
@@ -31,11 +34,12 @@ docker run --rm --cpus="${CPUS:-2}" --memory=2g --pids-limit=512 -e PYTHONDONTWR
 	# Wait for both (Caddy also issues its certificate).
 	for _ in \$(seq 100); do
 		curl -sf -o /dev/null http://127.0.0.1:8080/hello && [ -f /tmp/caddy/pki/authorities/local/root.crt ] \
-			&& curl -sf -o /dev/null --cacert /tmp/caddy/pki/authorities/local/root.crt https://localhost:8443/hello && break
+			&& curl -sf -o /dev/null --cacert /tmp/caddy/pki/authorities/local/root.crt https://localhost:8443/hello \
+			&& curl -sf -o /dev/null --cacert /tmp/caddy/pki/authorities/local/root.crt https://127.0.0.1:8446/hello && break
 		sleep 0.1
 	done
 
-	DIRECT=http://127.0.0.1:8080 PROXY=https://localhost:8443 CA=/tmp/caddy/pki/authorities/local/root.crt FILE=/tmp/file.bin \
+	DIRECT=http://127.0.0.1:8080 PROXY=https://localhost:8443 CA=/tmp/caddy/pki/authorities/local/root.crt FILE=/tmp/file.bin ODIN_CLIENT=/tmp/interop-client \
 		timeout -s KILL 400 python3 tests/interop/test_interop.py $TESTS 2>&1
 	rc=\$?
 

@@ -6,6 +6,9 @@
 	skip_install_trust
 	auto_https disable_redirects
 	storage file_system /tmp/caddy
+	# Unknown names get the certificate for localhost, so the WebSocket client's host name check can
+	# be tested with an otherwise valid certificate (tests/interop/client).
+	fallback_sni localhost
 	log {
 		level ERROR
 	}
@@ -18,4 +21,10 @@ localhost:8443 {
 		# 1 in 50 concurrent POSTs fails (Caddy aborts the response).
 		request_buffers 64KB
 	}
+}
+
+# A certificate for an IP address (the WebSocket client verifies those differently).
+127.0.0.1:8446 {
+	tls internal
+	reverse_proxy 127.0.0.1:8080
 }

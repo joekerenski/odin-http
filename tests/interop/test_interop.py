@@ -5,8 +5,9 @@ which sets:
 
     DIRECT  http://127.0.0.1:8080    the server
     PROXY   https://localhost:8443   Caddy in front of it (TLS, HTTP/2 to clients, pooled upstream)
-    CA      Caddy's root certificate
-    FILE    the file the server serves at /file
+    CA          Caddy's root certificate
+    FILE        the file the server serves at /file
+    ODIN_CLIENT tests/interop/client, the WebSocket client against Caddy
 """
 
 import asyncio
@@ -17,6 +18,7 @@ import os
 import random
 import ssl
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -301,6 +303,14 @@ class Proxy(Common, unittest.TestCase):
             r, body = self.request("POST", "/echo", body=data)
             self.assertEqual((r.status, body), (200, data), f"round {i}")
             time.sleep(2.5)
+
+    def test_odin_ws_client(self):
+        """The WebSocket client (wss:// through Caddy, see tests/interop/client)."""
+        p = subprocess.run([os.environ["ODIN_CLIENT"], CA], capture_output=True, timeout=120)
+        out = p.stdout.decode() + p.stderr.decode()
+        print("\n" + out.strip(), file=sys.stderr)
+        self.assertEqual(p.returncode, 0, out)
+        self.assertNotIn("FAIL", out)
 
     def test_http2_parallel(self):
         """HTTP/2 to Caddy, many streams at once, HTTP/1.1 from Caddy to the server."""

@@ -1,9 +1,10 @@
-// WebSocket client connections (ws:// only, no TLS).
+// WebSocket client connections, ws:// and wss:// (TLS through the system's OpenSSL, the server's
+// certificate and host name are always verified).
 //
 // Usage, on a thread that runs an nbio event loop (e.g. inside an HTTP handler or a timer, or
 // after `nbio.acquire_thread_event_loop` with your own `nbio.tick` loop):
 //
-//	c, err := websocket.dial("ws://localhost:8080/chat", {}, {
+//	c, err := websocket.dial("wss://example.com/chat", {}, {
 //		on_open    = proc(c: ^websocket.Conn) { websocket.send_text(c, "hi") },
 //		on_message = proc(c: ^websocket.Conn, kind: websocket.Message_Kind, data: []byte) { ... },
 //		on_close   = proc(c: ^websocket.Conn, code: u16, reason: string) { ... },
@@ -20,6 +21,7 @@ import "core:strings"
 import "core:time"
 
 import http ".."
+import "../openssl"
 
 Dial_Opts :: struct {
 	// Connection options; `check_origin` doesn't apply to clients.
@@ -28,6 +30,9 @@ Dial_Opts :: struct {
 	headers:    []Dial_Header,
 	// Connect + handshake, defaults to 10s.
 	timeout:    time.Duration,
+	// wss://: a PEM file with the CA certificates to trust instead of the system's (e.g. a private
+	// CA). Verification can't be turned off.
+	tls_ca_file: string,
 }
 
 Dial_Header :: struct {
@@ -36,12 +41,12 @@ Dial_Header :: struct {
 
 Dial_Error :: enum u8 {
 	None,
-	// Not a ws:// URL with a host.
+	// Not a ws:// or wss:// URL with a host.
 	Invalid_URL,
-	// wss:// (TLS) isn't supported.
-	Unsupported_Scheme,
 	// The host name could not be resolved (resolution is blocking).
 	Resolve_Failed,
+	// wss://: OpenSSL could not be set up, e.g. `tls_ca_file` couldn't be loaded.
+	TLS_Setup_Failed,
 }
 
 // Largest handshake response head accepted.
@@ -56,10 +61,12 @@ Client_State :: struct {
 	head:     [dynamic]byte,
 	deadline: time.Time,
 	offered_compression: bool,
+	// Set when the handshake failed while TLS I/O was still in flight, see `handshake_failed`.
+	failing:  string,
 }
 
 /*
-Opens a WebSocket connection to `url` (ws://host[:port][/path][?query]). Returns right away: the
+Opens a WebSocket connection to `url` (ws:// or wss://host[:port][/path][?query]). Returns right away: the
 connection is `.Connecting`, `on_open` is called once the handshake succeeded, `on_close` (1006,
 with the reason) if it failed. An error is returned (and no callback is called) when the URL is
 invalid or the host can't be resolved. Name resolution is blocking.
@@ -74,8 +81,21 @@ dial :: proc(url: string, opts: Dial_Opts, callbacks: Callbacks, allocator := co
 	endpoint := ep4 if ep4 != {} else ep6
 	if endpoint == {} { return nil, .Resolve_Failed }
 
+	ctx: ^openssl.SSL_CTX
+	if target.tls {
+		ctx = tls_client_ctx(opts.tls_ca_file)
+		if ctx == nil { return nil, .TLS_Setup_Failed }
+	}
+	// A context of our own (custom CA) is kept alive by the connection's SSL from here on.
+	defer if ctx != nil && opts.tls_ca_file != "" { openssl.SSL_CTX_free(ctx) }
+
 	c = new(Conn, allocator)
 	conn_init(c, .Client, opts.opts, callbacks, allocator)
+	if target.tls && !tls_init(c, ctx, target.host, target.is_ip) {
+		conn_destroy_compression(c)
+		free(c, allocator)
+		return nil, .TLS_Setup_Failed
+	}
 	if c._write_timeout == 0 { c._write_timeout = 30 * time.Second }
 	c.state = .Connecting
 
@@ -120,6 +140,10 @@ Ws_URL :: struct {
 	host_port:   string, // For resolving, always with a port.
 	host_header: string,
 	path:        string,
+	tls:         bool,
+	// For TLS: the name (or address) the certificate must be for, without brackets or port.
+	host:        string,
+	is_ip:       bool,
 }
 
 @(private)
@@ -129,7 +153,8 @@ parse_ws_url :: proc(url: string) -> (u: Ws_URL, err: Dial_Error) {
 	case len(url) >= 5 && http.ascii_equal_fold(url[:5], "ws://"):
 		rest = url[5:]
 	case len(url) >= 6 && http.ascii_equal_fold(url[:6], "wss://"):
-		return {}, .Unsupported_Scheme
+		rest = url[6:]
+		u.tls = true
 	case:
 		return {}, .Invalid_URL
 	}
@@ -150,11 +175,20 @@ parse_ws_url :: proc(url: string) -> (u: Ws_URL, err: Dial_Error) {
 	u.host_header = authority
 	// A port is there if the last ':' comes after an IPv6 literal's ']'.
 	has_port := false
+	u.host = authority
 	if colon := strings.last_index_byte(authority, ':'); colon >= 0 {
 		has_port = colon > strings.last_index_byte(authority, ']')
 		if has_port && colon == len(authority) - 1 { return {}, .Invalid_URL }
+		if has_port { u.host = authority[:colon] }
 	}
-	u.host_port = authority if has_port else strings.concatenate({authority, ":80"}, context.temp_allocator)
+	if len(u.host) >= 2 && u.host[0] == '[' && u.host[len(u.host) - 1] == ']' {
+		u.host = u.host[1:len(u.host) - 1]
+		u.is_ip = true
+	} else if _, ok := net.parse_ip4_address(u.host); ok {
+		u.is_ip = true
+	}
+	if u.host == "" { return {}, .Invalid_URL }
+	u.host_port = authority if has_port else strings.concatenate({authority, ":443" if u.tls else ":80"}, context.temp_allocator)
 	return u, .None
 }
 
@@ -170,13 +204,28 @@ on_dialed :: proc(op: ^nbio.Operation, c: ^Conn) {
 		return
 	}
 	c._socket = op.dial.socket
-	nbio.send_poly(c._socket, {transmute([]byte)c._client.request}, c, on_request_sent, all = true, timeout = handshake_time_left(c))
+	if c._tls != nil {
+		tls_handshake(c, proc(c: ^Conn, why: string) {
+			if why != "" {
+				handshake_failed(c, why)
+				return
+			}
+			send_request(c)
+		})
+		return
+	}
+	send_request(c)
 }
 
 @(private)
-on_request_sent :: proc(op: ^nbio.Operation, c: ^Conn) {
-	if op.send.err != nil {
-		handshake_failed(c, fmt.tprintf("sending the handshake failed: %v", op.send.err))
+send_request :: proc(c: ^Conn) {
+	transport_send(c, {transmute([]byte)c._client.request}, handshake_time_left(c), on_request_sent, all = true)
+}
+
+@(private)
+on_request_sent :: proc(c: ^Conn, _: int, err: IO_Error) {
+	if err != .None {
+		handshake_failed(c, fmt.tprintf("sending the handshake failed: %v", err))
 		return
 	}
 	recv_head(c)
@@ -187,21 +236,21 @@ recv_head :: proc(c: ^Conn) {
 	cs := c._client
 	if cap(cs.head) - len(cs.head) < 1024 { reserve(&cs.head, len(cs.head) + 4096) }
 	spare := ([^]byte)(raw_data(cs.head))[len(cs.head):cap(cs.head)]
-	nbio.recv_poly(c._socket, {spare}, c, on_head_recv, timeout = handshake_time_left(c))
+	transport_recv(c, spare, handshake_time_left(c), on_head_recv)
 }
 
 @(private)
-on_head_recv :: proc(op: ^nbio.Operation, c: ^Conn) {
+on_head_recv :: proc(c: ^Conn, received: int, err: IO_Error) {
 	cs := c._client
-	if op.recv.err != nil {
-		handshake_failed(c, fmt.tprintf("reading the handshake response failed: %v", op.recv.err))
-		return
-	}
-	if op.recv.received == 0 {
+	if err == .Closed {
 		handshake_failed(c, "the server closed the connection during the handshake")
 		return
 	}
-	non_zero_resize(&cs.head, len(cs.head) + op.recv.received)
+	if err != .None {
+		handshake_failed(c, fmt.tprintf("reading the handshake response failed: %v", err))
+		return
+	}
+	non_zero_resize(&cs.head, len(cs.head) + received)
 
 	end := strings.index(string(cs.head[:]), "\r\n\r\n")
 	if end < 0 {
@@ -281,6 +330,12 @@ check_handshake_response :: proc(c: ^Conn, head: string) -> (why: string) {
 // The handshake failed: the connection never opened.
 @(private)
 handshake_failed :: proc(c: ^Conn, reason: string) {
+	if transport_busy(c) {
+		// TLS I/O is in flight: fail it, the last completion comes back here.
+		if c._client.failing == "" { c._client.failing = strings.clone(reason, virtual.arena_allocator(&c._client.arena)) }
+		net.shutdown(c._socket, .Both)
+		return
+	}
 	c.state = .Closed
 	c._finalized = true
 	context.temp_allocator = c._temp
@@ -293,6 +348,7 @@ handshake_failed :: proc(c: ^Conn, reason: string) {
 @(private)
 client_release :: proc(c: ^Conn) {
 	cs := c._client
+	tls_destroy(c)
 	if c._socket != 0 { net.close(c._socket) }
 	virtual.arena_destroy(&cs.arena)
 	delete(cs.key, c._allocator)

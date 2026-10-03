@@ -123,17 +123,20 @@ ws_client_handshake_failures :: proc(t: ^testing.T) {
 	defer nbio.release_thread_event_loop()
 
 	// Rejected synchronously.
-	Bad :: struct { url: string, err: ws.Dial_Error }
+	Bad :: struct { url: string, err: ws.Dial_Error, ca_file: string }
 	for b in ([]Bad{
-		{"http://x/", .Invalid_URL},
-		{"wss://x/", .Unsupported_Scheme},
-		{"ws://", .Invalid_URL},
-		{"ws://user@x/", .Invalid_URL},
-		{"ws://x:/", .Invalid_URL},
-		{"ws://x/a b", .Invalid_URL},
-		{"ws://does-not-exist.invalid/", .Resolve_Failed},
+		{"http://x/", .Invalid_URL, ""},
+		{"ws://", .Invalid_URL, ""},
+		{"wss://", .Invalid_URL, ""},
+		{"ws://user@x/", .Invalid_URL, ""},
+		{"ws://x:/", .Invalid_URL, ""},
+		{"wss://[]:443/", .Invalid_URL, ""},
+		{"ws://x/a b", .Invalid_URL, ""},
+		{"ws://does-not-exist.invalid/", .Resolve_Failed, ""},
+		{"wss://does-not-exist.invalid/", .Resolve_Failed, ""},
+		{"wss://127.0.0.1:1/", .TLS_Setup_Failed, "/does/not/exist.pem"},
 	}) {
-		_, err := ws.dial(b.url, {}, {})
+		_, err := ws.dial(b.url, {tls_ca_file = b.ca_file}, {})
 		testing.expectf(t, err == b.err, "%q: %v, want %v", b.url, err, b.err)
 	}
 
@@ -145,6 +148,14 @@ ws_client_handshake_failures :: proc(t: ^testing.T) {
 		testing.expect(t, err == nil)
 		run_until_closed(t, &r)
 		testing.expectf(t, !r.opened && r.close_code == 1006 && strings.contains(r.reason, "expected 101"), "plain HTTP: opened=%v %v %q", r.opened, r.close_code, r.reason)
+	}
+	// wss:// to a server that doesn't speak TLS.
+	{
+		r := Client_Run{t = t}
+		_, err := ws.dial(fmt.tprintf("wss://127.0.0.1:%i/", ts.port), {timeout = 3 * time.Second}, client_callbacks(&r))
+		testing.expect(t, err == nil)
+		run_until_closed(t, &r)
+		testing.expectf(t, !r.opened && r.close_code == 1006 && strings.contains(r.reason, "TLS"), "TLS to plain HTTP: opened=%v %v %q", r.opened, r.close_code, r.reason)
 	}
 	port := ts.port
 	server_stop(ts)

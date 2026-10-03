@@ -116,6 +116,12 @@ Conn :: struct {
 	_release:      proc(c: ^Conn),
 	_h:            http.Hijacked,
 	_client:       ^Client_State,
+	// Client wss:// connections, see tls.odin.
+	_tls:               ^Tls,
+	_tls_handshake_done: proc(c: ^Conn, why: string),
+	_tls_write_timeout:  time.Duration,
+	_plain_recv_done:    Recv_Done,
+	_plain_send_done:    Send_Done,
 
 	// Compression (when negotiated).
 	_deflate:      Deflater,
@@ -351,30 +357,26 @@ start_recv :: proc(c: ^Conn) {
 	c._recv_pending = true
 	// The unused capacity of the buffer (slicing the dynamic array itself is bounded by its length).
 	spare := ([^]byte)(raw_data(c._rbuf))[len(c._rbuf):cap(c._rbuf)]
-	nbio.recv_poly(c._socket, {spare}, c, on_recv, timeout = timeout)
+	transport_recv(c, spare, timeout, on_recv)
 }
 
 @(private)
-on_recv :: proc(op: ^nbio.Operation, c: ^Conn) {
+on_recv :: proc(c: ^Conn, received: int, err: IO_Error) {
 	c._recv_pending = false
 	enter(c)
 	defer leave(c)
 	if c._aborting { return }
 
-	if op.recv.err != nil {
-		if op.recv.err == net.TCP_Recv_Error.Timeout {
+	if err != .None {
+		// .Closed: the peer closed the connection (without a close handshake if we didn't get one).
+		if err == .Timeout {
 			log.debug("websocket: peer did not finish closing in time")
 		}
 		abort(c)
 		return
 	}
-	if op.recv.received == 0 {
-		// The peer closed the TCP connection (without a close handshake if we didn't get one).
-		abort(c)
-		return
-	}
 
-	(^runtime.Raw_Dynamic_Array)(&c._rbuf).len += op.recv.received
+	(^runtime.Raw_Dynamic_Array)(&c._rbuf).len += received
 	c._last_rx = nbio.now()
 	c._awaiting_pong = false
 
@@ -781,23 +783,23 @@ send_next :: proc(c: ^Conn) {
 	c._inflight = n
 	c._send_pending = true
 	timeout := c._write_timeout if c._write_timeout > 0 else nbio.NO_TIMEOUT
-	nbio.send_poly(c._socket, bufs[:n], c, on_sent, all = false, timeout = timeout)
+	transport_send(c, bufs[:n], timeout, on_sent)
 }
 
 @(private)
-on_sent :: proc(op: ^nbio.Operation, c: ^Conn) {
+on_sent :: proc(c: ^Conn, sent: int, err: IO_Error) {
 	c._send_pending = false
 	enter(c)
 	defer leave(c)
 	if c._aborting { return }
-	if op.send.err != nil {
-		log.debugf("websocket: send failed: %v", op.send.err)
+	if err != .None {
+		log.debugf("websocket: send failed: %v", err)
 		abort(c)
 		return
 	}
 
 	// Account the written bytes to the frames in flight, in order.
-	sent := op.send.sent
+	sent := sent
 	done := 0
 	for i in 0 ..< c._inflight {
 		f := &c._queue[i]
@@ -866,7 +868,7 @@ leave :: proc(c: ^Conn) {
 
 @(private)
 maybe_finalize :: proc(c: ^Conn) {
-	if !c._aborting || c._busy > 0 || c._recv_pending || c._send_pending || c._finalized { return }
+	if !c._aborting || c._busy > 0 || c._recv_pending || c._send_pending || transport_busy(c) || c._finalized { return }
 	c._finalized = true
 	c.state = .Closed
 	unregister(c)
