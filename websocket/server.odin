@@ -578,11 +578,15 @@ push_frame :: proc(c: ^Conn, opcode: Opcode, payload: []byte, is_close := false)
 	f := Out_Frame{buf = buf, payload_len = len(payload), close = is_close, data = !is_control(opcode)}
 	if f.data { c._queued_bytes += len(payload) }
 
-	// Pings/pongs jump ahead of queued data (but not of a frame already being written);
+	// Pings/pongs jump ahead of queued data (but not of a frame already being written, nor of
+	// earlier pings/pongs, so pongs go out in the order their pings came in);
 	// everything else, including close, keeps its order.
 	if opcode == .Ping || opcode == .Pong {
 		at := 1 if c._send_pending else 0
 		at = min(at, len(c._queue))
+		for at < len(c._queue) && !c._queue[at].data && !c._queue[at].close {
+			at += 1
+		}
 		inject_at(&c._queue, at, f)
 	} else {
 		append(&c._queue, f)

@@ -71,18 +71,19 @@ This file is the working checklist. Finding IDs (S/F/C) refer to [REPORT.md](REP
 
 ## Phase 4: WebSockets (RFC 6455)
 
-- [ ] **W1** Upgrade API: inside a handler, `websocket.upgrade(req, res, opts, callbacks)` validates the handshake, sends 101, and takes the connection out of the HTTP loop.
+- [x] **W1** Upgrade API: inside a handler, `websocket.upgrade(req, res, opts, callbacks)` validates the handshake, sends 101, and takes the connection out of the HTTP loop. (2a71fc3)
   - Validation: GET, `Upgrade: websocket`, `Connection: upgrade` token, `Sec-WebSocket-Version: 13`, 16-byte base64 key.
   - Origin check hook and subprotocol negotiation.
-- [ ] **W2** Frame codec (sans-I/O):
+- [x] **W2** Frame codec (sans-I/O): (2a71fc3)
   - FIN/RSV/opcode/length/mask parsing.
   - Reject unmasked client frames, non-zero RSV without extension, reserved opcodes, fragmented or >125-byte control frames, non-minimal lengths and 64-bit lengths with the MSB set.
-- [ ] **W3** Message assembly: fragmentation, interleaved control frames, incremental UTF-8 validation for text (fail fast), `max_message_size` and `max_frame_size`.
-- [ ] **W4** Close handshake: status code validation, close-reason UTF-8, timeouts for the peer's close, TCP close ordering.
-- [ ] **W5** Ping/pong: auto-pong, optional keepalive pings with a dead-peer timeout; idle timeout.
+- [x] **W3** Message assembly: fragmentation, interleaved control frames, incremental UTF-8 validation for text (fail fast), `max_message_size` and `max_frame_size`. (2a71fc3)
+- [x] **W4** Close handshake: status code validation, close-reason UTF-8, timeouts for the peer's close, TCP close ordering. (2a71fc3)
+- [x] **W5** Ping/pong: auto-pong, optional keepalive pings with a dead-peer timeout; idle timeout. (2a71fc3)
 - [ ] **W6** Send path: bounded per-connection send queue with backpressure signal (`send` returns a full/queued status), zero-copy writes where possible, broadcast helper across threads (`nbio.exec` onto the owning loop).
 - [ ] **W7** Client side (`websocket.dial`) over the hardened client, with masking from a CSPRNG.
 - [ ] **W8** Autobahn TestSuite (fuzzingclient against our server, fuzzingserver against our client) in docker: 100% pass on cases 1-11 (non-compression), informational cases reviewed.
+  - Server side done: `autobahn/run.sh`. 296 OK, 0 failed; 6.4.3/6.4.4 NON-STRICT (invalid UTF-8 is detected once the whole frame has arrived, not mid-frame); 7.1.6/7.13.x informational. Case 9 (performance) shows nothing slow. Fixed 2.10 (pongs were sent in reverse order). Client side waits for W7.
 - [ ] **W9** `permessage-deflate` (RFC 7692) via `vendor:zlib`, with decompression-bomb limits; Autobahn 12-13.
 
 ## Phase 5: Client

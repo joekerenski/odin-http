@@ -11,3 +11,7 @@ complete
 readme
 routing
 bench/static/
+
+# Autobahn output.
+autobahn/reports/
+autobahn/echo-server

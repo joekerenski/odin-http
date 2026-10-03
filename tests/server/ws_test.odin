@@ -187,6 +187,35 @@ ws_frames_with_handshake :: proc(t: ^testing.T) {
 }
 
 @(test)
+ws_pongs_in_order :: proc(t: ^testing.T) {
+	// Autobahn 2.10: pings arriving in one read are queued together, their pongs must keep the order.
+	ts := server_start(t, ws_echo_handler())
+	defer server_stop(ts)
+
+	c, _, ok := ws_dial(t, ts)
+	defer net.close(c.sock)
+	testing.expect(t, ok)
+
+	mask := [4]byte{1, 2, 3, 4}
+	frames: strings.Builder
+	strings.builder_init(&frames, context.temp_allocator)
+	for i in 0..<10 {
+		payload := transmute([]byte)fmt.aprintf("payload-%i", i, allocator = context.temp_allocator)
+		hdr: [ws.MAX_HEADER_SIZE]byte
+		strings.write_bytes(&frames, ws.write_header(hdr[:], true, .Ping, len(payload), mask))
+		ws.apply_mask(payload, mask)
+		strings.write_bytes(&frames, payload)
+	}
+	raw_send({c.sock}, strings.to_string(frames))
+
+	for i in 0..<10 {
+		f, fok := ws_recv(&c)
+		want := fmt.tprintf("payload-%i", i)
+		testing.expectf(t, fok && f.opcode == .Pong && string(f.payload) == want, "pong %i: want %q, got %v", i, want, f)
+	}
+}
+
+@(test)
 ws_server_initiated_close :: proc(t: ^testing.T) {
 	ts := server_start(t, ws_echo_handler())
 	defer server_stop(ts)
