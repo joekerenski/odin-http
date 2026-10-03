@@ -46,7 +46,7 @@ Response_File :: struct {
 // is bounded and `write_timeout` applies per chunk rather than to the whole file.
 //
 // NOTE: not `nbio.sendfile`: on Linux (dev-2026-09) it leaks the pipe it splices through on every
-// successful call, see audit/REPORT.md (U1).
+// successful call, see docs/REPORT.md (U1).
 @(private)
 FILE_CHUNK :: 256 * mem.Kilobyte
 

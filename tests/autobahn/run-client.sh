@@ -1,20 +1,20 @@
 #!/usr/bin/env bash
-# Runs the Autobahn TestSuite in fuzzingserver mode against the WebSocket client (autobahn/client).
-# Needs docker. Report: autobahn/reports/clients/index.html, summary printed at the end.
+# Runs the Autobahn TestSuite in fuzzingserver mode against the WebSocket client (tests/autobahn/client).
+# Needs docker. Report: tests/autobahn/reports/clients/index.html, summary printed at the end.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/../.."
 
 PORT=9001
-mkdir -p autobahn/reports/clients
-odin build autobahn/client -o:speed -out:autobahn/echo-client
+mkdir -p tests/autobahn/reports/clients
+odin build tests/autobahn/client -o:speed -out:tests/autobahn/echo-client
 
 NAME=odin-http-fuzzingserver
 docker rm -f $NAME > /dev/null 2>&1 || true
 docker run -d --rm --name $NAME \
 	--platform linux/amd64 \
 	-p 127.0.0.1:$PORT:9001 \
-	-v "$PWD/autobahn/fuzzingserver.json:/config/fuzzingserver.json:ro" \
-	-v "$PWD/autobahn/reports/clients:/reports/clients" \
+	-v "$PWD/tests/autobahn/fuzzingserver.json:/config/fuzzingserver.json:ro" \
+	-v "$PWD/tests/autobahn/reports/clients:/reports/clients" \
 	crossbario/autobahn-testsuite \
 	wstest -m fuzzingserver -s /config/fuzzingserver.json > /dev/null
 trap 'docker rm -f $NAME > /dev/null 2>&1 || true' EXIT
@@ -26,11 +26,11 @@ for _ in $(seq 1 60); do
 done
 sleep 1
 
-./autobahn/echo-client ws://127.0.0.1:$PORT
+./tests/autobahn/echo-client ws://127.0.0.1:$PORT
 
 python3 - <<'PY'
 import json, collections
-r = json.load(open("autobahn/reports/clients/index.json"))["odin-http"]
+r = json.load(open("tests/autobahn/reports/clients/index.json"))["odin-http"]
 by = collections.Counter(v["behavior"] for v in r.values())
 print("\nresults:", dict(by), "of", len(r))
 bad = sorted((k for k, v in r.items() if v["behavior"] not in ("OK", "INFORMATIONAL", "NON-STRICT")),

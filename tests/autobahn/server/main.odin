@@ -1,6 +1,6 @@
-// Echo server for the Autobahn TestSuite (fuzzingclient), see autobahn/run.sh.
+// Echo server for the Autobahn TestSuite (fuzzingclient), see tests/autobahn/run.sh.
 //
-//	odin run autobahn/server -o:speed -- 9001
+//	odin run tests/autobahn/server -o:speed -- 9001
 package autobahn_server
 
 import "core:fmt"
@@ -10,8 +10,8 @@ import "core:net"
 import "core:os"
 import "core:strconv"
 
-import http "../.."
-import ws "../../websocket"
+import http "../../.."
+import ws "../../../websocket"
 
 main :: proc() {
 	context.logger = log.create_console_logger(.Error)

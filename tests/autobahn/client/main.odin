@@ -1,9 +1,9 @@
-// Autobahn TestSuite client driver (fuzzingserver mode), see autobahn/run-client.sh.
+// Autobahn TestSuite client driver (fuzzingserver mode), see tests/autobahn/run-client.sh.
 //
 // Asks the fuzzing server for the number of cases, runs each one (echoing every message back),
 // then asks it to write the report.
 //
-//	odin run autobahn/client -o:speed -- ws://127.0.0.1:9001
+//	odin run tests/autobahn/client -o:speed -- ws://127.0.0.1:9001
 package autobahn_client
 
 import "core:fmt"
@@ -13,7 +13,7 @@ import "core:nbio"
 import "core:os"
 import "core:strconv"
 
-import ws "../../websocket"
+import ws "../../../websocket"
 
 AGENT :: "odin-http"
 

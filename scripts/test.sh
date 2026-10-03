@@ -85,7 +85,7 @@ step() {
 check_examples() {
 	# bench/server imports the library as `lib:http`.
 	mkdir -p "$OUT/lib" && ln -sfn "$PWD" "$OUT/lib/http"
-	for e in examples/*/ autobahn/server/ bench/server/; do
+	for e in examples/*/ tests/autobahn/server/ bench/server/; do
 		odin check "$e" -vet --strict-style -collection:lib="$OUT/lib" || return 1
 	done
 }

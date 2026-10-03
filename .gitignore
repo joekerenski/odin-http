@@ -3,7 +3,6 @@ ols.json
 opm
 Taskfile.yml
 *.exe
-docs/build
 
 # Example binaries.
 minimal
@@ -12,11 +11,11 @@ readme
 routing
 bench/static/
 
-# Autobahn output.
-autobahn/reports/
-autobahn/echo-server
+# Autobahn output (HTML/JSON reports and the test binaries).
+**/autobahn/reports/
+tests/autobahn/echo-server
 
 .claude/settings.local.json
 .hunt-bt.txt
-autobahn/echo-client
+tests/autobahn/echo-client
 __pycache__/

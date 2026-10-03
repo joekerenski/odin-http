@@ -1,256 +1,257 @@
-# Odin HTTP
+# odin-http
 
-> **Personal copy of [laytan/odin-http](https://github.com/laytan/odin-http)** by Laytan Laats, with the full original history.
-> It adds a hardened HTTP/1.1 server (see [audit/](audit/)) and a WebSocket server ([websocket/](websocket/)).
-> Not affiliated with or endorsed by the original project. All credit for the original library goes to its author.
+An HTTP/1.1 server, an HTTP(S) client and WebSockets for [Odin](https://odin-lang.org), on `core:nbio`
+(io_uring on Linux, kqueue on macOS). macOS and Linux only.
 
-A HTTP/1.1 implementation for Odin purely written in Odin (besides SSL).
+> A personal, hardened copy of [laytan/odin-http](https://github.com/laytan/odin-http) by Laytan Laats,
+> with its full history. Not affiliated with or endorsed by the original project; all credit for the
+> original library goes to its author.
 
-See generated package documentation at [odin-http.laytan.dev](https://odin-http.laytan.dev).
-
-See below examples or the examples directory.
-
-## Disclaimer
-
-This is not intended for production use and serves as a proof of concept for the implementation that will be going into Odin's core collection.
-
-## Compatibility
-
-This is beta software, confirmed to work in my own use cases but can certainly contain edge cases and bugs that I did not catch.
-Please file issues for any bug or suggestion you encounter/have.
-
-I am usually on a recent master version of Odin and commits will be made with new features if applicable, backwards compatibility or even
-stable version compatibility is not currently a thing.
-
-Because this is still heavily in development, I do not hesitate to push API changes at the moment, so beware.
-
-This copy targets macOS and Linux only (the upstream project also supports Windows).
-Any other distributions or versions have not been tested and might not work.
-
-## Dependencies
-
-The *client* package depends on OpenSSL 3 for HTTPS (macOS: `brew install openssl@3`).
-
-For Linux, most distros come with OpenSSL, if not you can install it with a package manager, usually under `libssl3`.
-
-The *websocket* package links the system zlib for compression (`permessage-deflate`), on Linux usually `zlib1g-dev` / `zlib-devel`,
-and OpenSSL 3 for `wss://` (macOS: `brew install openssl@3`).
-
-## Performance
-
-`bench/http.sh` (HTTP, wrk) and `bench/ws.sh` (WebSocket) run in the Linux container; `bench/http.sh 5 2fe913b .`
-compares upstream's last commit with the working tree. Linux arm64 (OrbStack), 2 server threads, wrk on 2 other cores:
-
-| | req/s | p99 |
+| Import | Package | What it is |
 |---|---|---|
-| plaintext, 64 connections | ~600k | 0.2-1.2ms |
-| JSON | ~620k | 0.2-2.3ms |
-| 64 KiB responses | ~220k | 0.8-2.4ms |
-| 1 KiB POST echo | ~540-580k | 0.5-1.5ms |
-| 1 MiB static file | ~14k (~14 GiB/s) | 5ms |
+| `odin-http` | `http` | The server: routing, middleware, request bodies, cookies, static files, streaming responses, rate limiting |
+| `odin-http/client` | `client` | HTTP/1.1 client for `http://` and `https://`, blocking or async, with connection reuse |
+| `odin-http/websocket` | `websocket` | WebSockets (RFC 6455 + permessage-deflate): server upgrade and `ws://`/`wss://` client |
+| `odin-http/openssl` | `openssl` | OpenSSL 3 bindings used by the client and WebSocket TLS (you don't need to import it) |
 
-Keep-alive throughput matches upstream; static files are about twice as fast. Throughput without keep-alive is
-too noisy on this VM to compare (100k-600k for either version).
+The server speaks plain HTTP; for HTTPS put [Caddy](#running-behind-caddy) in front of it. The clients
+speak TLS themselves and always verify certificates.
 
-## IO implementations
+## State
 
-Although these implementation details are not exposed when using the package, these are the underlying kernel API's that are used.
+- **Server**: strict HTTP/1.1 parsing and framing, limits and timeouts on everything a client controls,
+  graceful shutdown. Fuzzed, stress-tested (also under the address sanitizer), and tested against curl,
+  Python and Caddy. The audit it went through and what was fixed: [docs/REPORT.md](docs/REPORT.md),
+  [docs/ISSUES.md](docs/ISSUES.md).
+- **WebSockets**: server and client pass the full [Autobahn TestSuite](https://github.com/crossbario/autobahn-testsuite)
+  (517/517 cases each, compression included).
+- **Client**: verified TLS, strict response parsing with size limits, deadlines, keep-alive.
+- **Performance**: plaintext ~600k req/s with keep-alive on 2 threads (Linux arm64), WebSocket echo
+  ~1.9M small messages/s on one thread. See [Performance](#performance).
+- Not here: HTTP/2 (Caddy does it for you), TLS in the server (same), Windows.
 
-- Linux:   [io_uring](https://en.wikipedia.org/wiki/Io_uring)
-- Darwin:  [KQueue](https://en.wikipedia.org/wiki/Kqueue)
+## Installation
 
-The IO part of this package can be used on its own for other types of applications, see the nbio directory for the documentation on that.
-It has APIs for reading, writing, opening, closing, seeking files and accepting, connecting, sending, receiving and closing sockets, both UDP and TCP, fully cross-platform.
+Needs a recent Odin (developed against `dev-2026-08`), OpenSSL 3 and zlib:
 
-## Server example
+```sh
+brew install openssl@3                  # macOS (zlib comes with the OS)
+sudo apt install libssl-dev zlib1g-dev  # Debian/Ubuntu
+```
+
+Odin has no package manager: put the repository somewhere and import it, either through a collection or
+by path.
+
+**As a collection** (one checkout for all your projects):
+
+```sh
+git clone https://github.com/joekerenski/odin-http ~/odin-libs/odin-http
+odin run . -collection:libs=$HOME/odin-libs
+```
+
+```odin
+import http "libs:odin-http"
+import "libs:odin-http/client"
+import ws "libs:odin-http/websocket"
+```
+
+**Inside your project** (e.g. as a git submodule):
+
+```sh
+git submodule add https://github.com/joekerenski/odin-http deps/odin-http
+```
+
+```odin
+import http "deps/odin-http"   // relative to the importing file
+import "deps/odin-http/client"
+```
+
+For the language server, add the collection to your project's `ols.json`:
+`"collections": [{"name": "libs", "path": "/Users/you/odin-libs"}]`.
+
+Only the packages you import are compiled; the tests, benchmarks and tools in this repository are never
+part of your build.
+
+## Server
 
 ```odin
 package main
 
-import "core:fmt"
+import "core:encoding/json"
 import "core:log"
 import "core:net"
 import "core:time"
 
-import http "../.." // Change to path of package.
+import http "libs:odin-http"
+
+Greeting :: struct {
+	name: string,
+}
 
 main :: proc() {
 	context.logger = log.create_console_logger(.Info)
 
-	s: http.Server
-	// Register a graceful shutdown when the program receives a SIGINT signal.
-	http.server_shutdown_on_interrupt(&s)
-
-	// Set up routing
 	router: http.Router
 	http.router_init(&router)
 	defer http.router_destroy(&router)
 
-	// Routes are tried in order.
-	// Route matching is implemented using an implementation of Lua patterns, see the docs on them here:
-	// https://www.lua.org/pil/20.2.html
-	// They are very similar to regex patterns but a bit more limited, which makes them much easier to implement since Odin does not have a regex implementation.
-
-	// Matches /users followed by any word (alphanumeric) followed by /comments and then / with any number.
-	// The captures are available as req.url_params[0] and req.url_params[1], or by name with http.url_param(req, "user").
-	http.route_get(&router, "/users/:user/comments/:comment", http.handler(proc(req: ^http.Request, res: ^http.Response) {
-		http.respond_plain(res, fmt.tprintf("user %s, comment: %s", req.url_params[0], req.url_params[1]))
+	// ":name" matches one path segment, "*rest" the remainder of the path.
+	http.route_get(&router, "/hello/:name", http.handler(proc(req: ^http.Request, res: ^http.Response) {
+		name, _ := http.url_param(req, "name")
+		http.respond_json(res, Greeting{name})
 	}))
-	http.route_get(&router, "/cookies", http.handler(cookies))
-	http.route_get(&router, "/api", http.handler(api))
-	http.route_get(&router, "/ping", http.handler(ping))
-	http.route_get(&router, "/index", http.handler(index))
 
-	// Matches every get request that did not match another route.
-	http.route_get(&router, "/*path", http.handler(static))
+	// Request bodies arrive in a callback (the handler must not block, see below).
+	http.route_post(&router, "/greet", http.handler(proc(req: ^http.Request, res: ^http.Response) {
+		http.body(req, 64 * 1024, res, proc(res: rawptr, body: http.Body, err: http.Body_Error) {
+			res := (^http.Response)(res)
+			if err != nil {
+				http.respond(res, http.body_error_status(err))
+				return
+			}
+			g: Greeting
+			if json.unmarshal_string(body, &g) != nil {
+				http.respond(res, http.Status.Bad_Request)
+				return
+			}
+			http.respond_plain(res, g.name)
+		})
+	}))
 
-	http.route_post(&router, "/ping", http.handler(post_ping))
+	// Files under ./public, with ranges and the right Content-Type; paths can't escape the directory.
+	http.route_get(&router, "/static/*path", http.handler(proc(req: ^http.Request, res: ^http.Response) {
+		http.respond_dir(res, "/static", "public", req.url.path)
+	}))
 
-	routed := http.router_handler(&router)
+	// Middleware: 100 requests per minute per client.
+	routes := http.router_handler(&router)
+	limit: http.Rate_Limit_Data
+	limited := http.rate_limit(&limit, &routes, &http.Rate_Limit_Opts{window = time.Minute, max = 100, trusted_proxies = 1})
 
-	log.info("Listening on http://localhost:6969")
+	s: http.Server
+	http.server_shutdown_on_interrupt(&s) // Ctrl-C: finish what's in flight, then stop.
 
-	err := http.listen_and_serve(&s, routed, net.Endpoint{address = net.IP4_Loopback, port = 6969})
-	fmt.assertf(err == nil, "server stopped with error: %v", err)
-}
-
-cookies :: proc(req: ^http.Request, res: ^http.Response) {
-	append(
-		&res.cookies,
-		http.Cookie{
-			name         = "Session",
-			value        = "123",
-			expires_gmt  = time.now(),
-			max_age_secs = 10,
-			http_only    = true,
-			same_site    = .Lax,
-		},
-	)
-	http.respond_plain(res, "Yo!")
-}
-
-api :: proc(req: ^http.Request, res: ^http.Response) {
-	if err := http.respond_json(res, req.line); err != nil {
-		log.errorf("could not respond with JSON: %s", err)
-	}
-}
-
-ping :: proc(req: ^http.Request, res: ^http.Response) {
-	http.respond_plain(res, "pong")
-}
-
-index :: proc(req: ^http.Request, res: ^http.Response) {
-	http.respond_file(res, "examples/complete/static/index.html")
-}
-
-static :: proc(req: ^http.Request, res: ^http.Response) {
-	http.respond_dir(res, "/", "examples/complete/static", req.url.path)
-}
-
-post_ping :: proc(req: ^http.Request, res: ^http.Response) {
-	http.body(req, len("ping"), res, proc(res: rawptr, body: http.Body, err: http.Body_Error) {
-		res := cast(^http.Response)res
-
-		if err != nil {
-			http.respond(res, http.body_error_status(err))
-			return
-		}
-
-		if body != "ping" {
-			http.respond(res, http.Status.Unprocessable_Content)
-			return
-		}
-
-		http.respond_plain(res, "pong")
-	})
+	opts := http.Default_Server_Opts
+	opts.max_body_size = 16 * 1024 * 1024
+	err := http.listen_and_serve(&s, limited, net.Endpoint{net.IP4_Loopback, 8080}, opts)
+	if err != nil { log.error(err) }
 }
 ```
 
-## Client example
+**How handlers run.** The server runs one event loop per thread (`Server_Opts.thread_count`, defaults to
+the core count). Handlers run on those threads and must not block: anything slow (reading the body, calling
+another service with `client.request_async`, timers) continues in a callback, and the handler (or a
+callback) calls `respond` exactly once. `context.temp_allocator` belongs to the request and is freed after
+the response. Responses can also be streamed with `response_writer_init` (chunked).
 
-The client verifies certificates and host names (TLS through the system's OpenSSL, `Opts.tls_ca_file` for a
-private CA), reads responses within limits (`Opts`: 16 MiB bodies, 64 KiB headers, 60s per request by
-default) and validates what it sends. Connections are kept alive and reused per origin (`Opts.idle_timeout`,
-`max_idle_per_host`, `disable_keep_alive`). `request`/`get` block; in an HTTP handler use `request_async`,
-which runs on the handler's event loop.
+**Limits and timeouts** (`Server_Opts`, defaults in `Default_Server_Opts`): request line and header section
+8000 bytes, 100 header fields, bodies 8 MiB, `max_connections`, 30s to send the request head, 30s per body
+read, 30s per write, 3 minutes idle between keep-alive requests, 30s for in-flight requests at shutdown.
+
+More: [examples/](examples/) (`minimal`, `routing`, `complete` with cookies and static files, `client`,
+`websocket` chat).
+
+## Client
 
 ```odin
-package main
-
 import "core:fmt"
+import "core:time"
 
-import http "odin-http"
-import "odin-http/client"
+import http "libs:odin-http"
+import "libs:odin-http/client"
 
-main :: proc() {
+fetch :: proc() {
+	// Blocking (for programs and tools).
 	res, err := client.get("https://example.com/")
 	if err != nil {
-		fmt.println("request failed:", err)
+		fmt.println("request failed:", err) // e.g. .Timeout, .TLS_Verification_Failed, .Truncated
 		return
 	}
 	defer client.response_destroy(&res)
 	fmt.println(res.status, res.headers, res.body)
 
-	// POST with JSON.
+	// With a method, headers, cookies and a JSON body.
 	req: client.Request
 	client.request_init(&req, .Post)
 	defer client.request_destroy(&req)
-	client.with_json(&req, struct{name: string}{"Laytan"})
-	res2, err2 := client.request(&req, "https://example.com/api")
+	http.headers_set(&req.headers, "authorization", "Bearer ...")
+	client.with_json(&req, struct{name: string}{"odin"})
+	res2, err2 := client.request(&req, "https://example.com/api", {timeout = 10 * time.Second})
 	if err2 == nil { client.response_destroy(&res2) }
 }
 
-// Inside an HTTP handler: the response arrives on the handler's thread.
-handler :: proc(req: ^http.Request, res: ^http.Response) {
+// In a handler: async, on the handler's event loop; the callback runs on the same thread.
+proxy :: proc(req: ^http.Request, res: ^http.Response) {
 	r: client.Request
-	client.request_init(&r)
-	defer client.request_destroy(&r)
+	client.request_init(&r, .Get, context.temp_allocator)
 	err := client.request_async(&r, "https://example.com/", client.Default_Opts, res, proc(upstream: client.Response, err: client.Error, user_data: rawptr) {
 		res := (^http.Response)(user_data)
 		if err != nil {
 			http.respond(res, http.Status.Bad_Gateway)
 			return
 		}
-		u := upstream
-		defer client.response_destroy(&u)
-		http.respond_plain(res, u.body) // body_set copies
+		upstream := upstream
+		defer client.response_destroy(&upstream)
+		http.respond_plain(res, upstream.body) // copies the body
 	})
 	if err != nil { http.respond(res, http.Status.Bad_Gateway) }
 }
 ```
 
+- TLS: certificate chain, host name (or IP address) and TLS ≥ 1.2 are always checked; there is no switch to
+  turn that off. `Opts.tls_ca_file` trusts a private CA instead of the system store.
+- Responses are read completely, within `Opts.max_body_size` (16 MiB), `max_header_size` (64 KiB) and
+  `max_headers` (100). Chunked and Content-Length bodies, trailers in `res.trailers`, cookies in
+  `res.cookies`. A body that's cut short is an error, not a short body.
+- Deadlines: `connect_timeout` (10s) and `timeout` for the whole request (60s).
+- Connections are kept alive and reused per origin, across threads (`idle_timeout` 30s,
+  `max_idle_per_host` 4, `disable_keep_alive`). A dead pooled connection is replaced transparently;
+  idempotent requests (GET, HEAD, PUT, DELETE) are retried once if the server closed it as the request went out.
+- Requests are validated, not escaped: a header value with a line break or an invalid cookie is refused
+  with `.Invalid_Request`.
+- Names are resolved with a blocking DNS lookup.
+
 ## WebSockets
 
-The `websocket` package (RFC 6455, with `permessage-deflate` from RFC 7692) has a server side, upgrading
-a request inside any handler, and a client (`ws://` and `wss://`; TLS through the system OpenSSL, the server's
-certificate and host name are always verified, `Dial_Opts.tls_ca_file` for a private CA). Both pass the full
-[Autobahn TestSuite](https://github.com/crossbario/autobahn-testsuite) (`autobahn/run.sh`, `autobahn/run-client.sh`).
-
 ```odin
-import ws "odin-http/websocket"
+import http "libs:odin-http"
+import ws "libs:odin-http/websocket"
 
-// Server: inside an HTTP handler.
-ws.upgrade(req, res, {compression = true}, {
-	on_message = proc(c: ^ws.Conn, kind: ws.Message_Kind, data: []byte) {
-		ws.send(c, kind, data) // echo
-	},
-})
+// Server: upgrade inside any handler.
+chat :: proc(req: ^http.Request, res: ^http.Response) {
+	ws.upgrade(req, res, {compression = true}, {
+		on_open    = proc(c: ^ws.Conn) { ws.send_text(c, "welcome") },
+		on_message = proc(c: ^ws.Conn, kind: ws.Message_Kind, data: []byte) {
+			ws.send(c, kind, data) // echo
+		},
+		on_close   = proc(c: ^ws.Conn, code: u16, reason: string) {},
+	})
+}
 
-// Client: on a thread with an nbio event loop (e.g. a server thread).
-ws.dial("ws://localhost:8080/chat", {opts = {compression = true}}, {
-	on_open    = proc(c: ^ws.Conn) { ws.send_text(c, "hello") },
-	on_message = proc(c: ^ws.Conn, kind: ws.Message_Kind, data: []byte) {},
-	on_close   = proc(c: ^ws.Conn, code: u16, reason: string) {},
-})
+// Client: on a thread with an nbio event loop (a server thread, or your own nbio.tick loop).
+connect :: proc() {
+	ws.dial("wss://example.com/socket", {opts = {compression = true}}, {
+		on_open    = proc(c: ^ws.Conn) { ws.send_text(c, "hello") },
+		on_message = proc(c: ^ws.Conn, kind: ws.Message_Kind, data: []byte) {},
+		on_close   = proc(c: ^ws.Conn, code: u16, reason: string) {},
+	})
+}
 ```
 
-Connections live on one event loop thread; use `ws.handle(c)` with `ws.send_from_any_thread` / `ws.broadcast`
-from other threads.
+- A connection lives on one event loop thread. From other threads use `ws.handle(c)` with
+  `send_from_any_thread`, `close_from_any_thread` and `broadcast` (one copy per event loop, safe after the
+  connection or the server is gone). See [examples/websocket](examples/websocket/main.odin).
+- `Opts`: `max_message_size` (1 MiB; compressed messages are limited after decompression),
+  `send_queue_limit` (4 MiB, `send` returns `.Queue_Full` beyond it, `on_drain` when it's empty again),
+  keepalive pings every 30s, `subprotocols`, `compression` (permessage-deflate).
+- The server accepts browser connections only from the same origin by default (`check_origin`, against
+  cross-site WebSocket hijacking); `ws.allow_any_origin` turns that off.
+- `wss://` verifies the server like the HTTP client does (`Dial_Opts.tls_ca_file` for a private CA).
 
 ## Running behind Caddy
 
-The server speaks plain HTTP/1.1; put [Caddy](https://caddyserver.com) in front for TLS, HTTP/2 and
-HTTP/3. WebSockets go through as is. Tested with Caddy 2.11 (`scripts/interop.sh`).
+The server speaks plain HTTP/1.1; [Caddy](https://caddyserver.com) in front gives you TLS (with automatic
+certificates), HTTP/2 and HTTP/3. WebSockets go through as is. Tested with Caddy 2.11 (`scripts/interop.sh`).
 
 ```caddyfile
 example.com {
@@ -261,20 +262,60 @@ example.com {
 ```
 
 - Listen on `127.0.0.1` (`net.IP4_Loopback`), so clients can't bypass Caddy.
-- `request_buffers` (any size) works around a race in Go's HTTP/1 server: with a fast upstream, about 1
-  in 50 concurrent POSTs gets an aborted response without it (Caddy logs "aborting with incomplete
-  response ... use of closed network connection"). Caddy's experimental `enable_full_duplex` server
-  option fixes it too.
-- Set `Rate_Limit_Opts.trusted_proxies = 1`, otherwise every client shares Caddy's address. Caddy
-  replaces the `X-Forwarded-For` a client sends, so it can't be spoofed.
-- Keep `Server_Opts.idle_timeout` (default 3 minutes) above Caddy's upstream keep-alive (2 minutes).
+- Keep `request_buffers` (any size): it works around a race in Go's HTTP/1 server that, with a fast
+  upstream, aborts about 1 in 50 concurrent POST responses (Caddy logs "aborting with incomplete response
+  ... use of closed network connection").
+- Set `Rate_Limit_Opts.trusted_proxies = 1`, otherwise every client shares Caddy's address. Caddy replaces
+  the `X-Forwarded-For` a client sends, so it can't be spoofed.
+- Keep `Server_Opts.idle_timeout` (3 minutes) above Caddy's upstream keep-alive (2 minutes).
 - The WebSocket origin check works unchanged: Caddy forwards the `Host` header.
 
-## Tests
+In Docker, io_uring needs a seccomp profile that allows it (e.g. `--security-opt seccomp=unconfined`);
+x86-64 emulation (Rosetta) doesn't implement io_uring.
+
+## Performance
+
+Linux arm64 (OrbStack), server on 2 threads, wrk on 2 other cores (`bench/http.sh`):
+
+| HTTP, keep-alive | req/s | p99 |
+|---|---|---|
+| plaintext, 64 connections | ~600k | 0.2-1.2ms |
+| JSON | ~620k | 0.2-2.3ms |
+| 64 KiB responses | ~220k | 0.8-2.4ms |
+| 1 KiB POST echo | ~540-580k | 0.5-1.5ms |
+| 1 MiB static file | ~14k (~14 GiB/s) | 5ms |
+
+WebSockets, one server thread (`bench/ws.sh`): ~1.9M echoes/s of 32 bytes (p50 0.56ms), ~650k of 4 KiB,
+~110k compressed 4 KiB text, broadcasts to 1000 clients ~390k deliveries/s.
+
+## Development
+
+```
+odin-http/
+├── *.odin          package http (the server)
+├── client/         package client
+├── websocket/      package websocket
+├── openssl/        package openssl
+├── examples/       runnable examples
+├── tests/          unit, live-server, fuzz, client, interop and Autobahn suites
+├── bench/          HTTP and WebSocket benchmarks
+├── scripts/        test runners and the Linux test image
+└── docs/           the audit report and work list
+```
 
 ```sh
-scripts/test.sh [--asan]                     # all suites (macOS / Linux)
-scripts/test-linux.sh [--asan] [--stress 5]  # Linux (io_uring) in docker, capped at 2 CPUs
+scripts/test.sh [--asan]                     # all suites, macOS or Linux
+scripts/test-linux.sh [--asan] [--stress 5]  # Linux (io_uring) in docker, CPU and memory capped
 scripts/test-linux.sh --hunt 40              # repeat the stress tests until one fails, with thread dumps
-scripts/interop.sh                           # curl, Python and Caddy (TLS, HTTP/2) against a real server
+scripts/interop.sh                           # curl, Python and Caddy (TLS, HTTP/2) against the server and clients
+tests/autobahn/run.sh                        # Autobahn TestSuite against the server (docker)
+tests/autobahn/run-client.sh                 # ... against the WebSocket client
+bench/http.sh 5 2fe913b .                    # HTTP benchmark, any revisions side by side
+bench/ws.sh                                  # WebSocket benchmark
 ```
+
+Every runner is capped (time, output, CPU, memory) so a hung test can't run away.
+
+## License
+
+MIT, see [LICENSE](LICENSE). Original work by Laytan Laats.

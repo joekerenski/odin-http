@@ -1,8 +1,8 @@
 {
-	"version": "0.0.4-beta",
-	"description": "A HTTP/1.1 client/server implementation",
-	"url": "https://github.com/laytan/odin-http",
+	"version": "1.0.0",
+	"description": "HTTP/1.1 server, HTTP(S) client and WebSockets for Odin (macOS and Linux)",
+	"url": "https://github.com/joekerenski/odin-http",
 	"readme": "README.md",
 	"license": "MIT",
-	"keywords": ["HTTP"]
+	"keywords": ["HTTP", "HTTPS", "WebSocket", "server", "client"]
 }
