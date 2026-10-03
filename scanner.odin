@@ -56,6 +56,7 @@ Scanner :: struct /* #no_copy */ {
 	// Absolute deadline for the reads, zero for none.
 	deadline:                     time.Time,
 	// Set when a read failed because of `read_timeout` or `deadline`; the callback gets `.Unknown`.
+	// Both are enforced by the thread's sweeper (`server_sweep`), up to `sweep_interval` late.
 	timed_out:                    bool,
 }
 
@@ -225,32 +226,41 @@ scanner_scan :: proc(
 	s.callback = callback
 	s.could_be_too_short = could_be_too_short
 
-	timeout := nbio.NO_TIMEOUT
+	// The read's deadline, enforced by the thread's sweeper (see `server_sweep`), which is much
+	// cheaper than a timeout on every read.
+	now := nbio.now()
+	deadline := s.deadline
 	if s.read_timeout > 0 {
-		timeout = s.read_timeout
-	}
-	if s.deadline != {} {
-		left := time.diff(nbio.now(), s.deadline)
-		if left <= 0 {
-			s.timed_out = true
-			set_err(s, .Unknown)
-			s.callback, s.user_data = nil, nil
-			callback(user_data, "", s._err)
-			return
-		}
-		if timeout == nbio.NO_TIMEOUT || left < timeout {
-			timeout = left
+		per_read := time.time_add(now, s.read_timeout)
+		if deadline == {} || time.diff(per_read, deadline) > 0 {
+			deadline = per_read
 		}
 	}
+	if deadline != {} && time.diff(now, deadline) <= 0 {
+		s.timed_out = true
+		set_err(s, .Unknown)
+		s.callback, s.user_data = nil, nil
+		callback(user_data, "", s._err)
+		return
+	}
+	s.connection.read_deadline = deadline
 
 	assert_has_td()
-	nbio.recv_poly(s.connection.socket, {s.buf[s.end:len(s.buf)]}, s, scanner_on_read, timeout = timeout)
+	nbio.recv_poly(s.connection.socket, {s.buf[s.end:len(s.buf)]}, s, scanner_on_read)
 }
 
 scanner_on_read :: proc(op: ^nbio.Operation, s: ^Scanner) {
 	context.temp_allocator = virtual.arena_allocator(&s.connection.temp_allocator)
 
 	defer scanner_scan(s, s.user_data, s.callback)
+
+	s.connection.read_deadline = {}
+	if s.connection.read_expired {
+		// The sweeper shut the socket down because the deadline passed; whatever the read returned.
+		s.timed_out = true
+		s._err = .Unknown
+		return
+	}
 
 	if op.recv.err != nil {
 		#partial switch op.recv.err.(net.TCP_Recv_Error) {

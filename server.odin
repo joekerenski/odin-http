@@ -50,6 +50,8 @@ Server_Opts :: struct {
 	max_connections:         int,
 
 	// Timeouts. A zero value means the default, a negative value disables the timeout.
+	// They are checked periodically, so one fires up to a quarter of the shortest timeout late (at most a
+	// second).
 	//
 	// How long a keep-alive connection may sit idle waiting for the next request. Defaults to 3 minutes.
 	// When the server runs behind a reverse proxy that pools connections, keep this above the
@@ -126,6 +128,7 @@ Server_Thread :: struct {
 	date:         Server_Date,
 	date_timer:   ^nbio.Operation,
 	signal_timer: ^nbio.Operation,
+	sweep_timer:  ^nbio.Operation,
 }
 
 @(private, disabled = ODIN_DISABLE_ASSERT)
@@ -237,6 +240,7 @@ _server_thread_init :: proc(s: ^Server, ttd: ^Server_Thread) {
 
 	// Start keeping track of and caching the date for the required date header.
 	server_date_start(td)
+	server_sweep_start(td)
 
 	if td == &s.threads[0] && atomic_load(&on_interrupt_server) == s {
 		_server_watch_interrupts(td)
@@ -302,6 +306,7 @@ _server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
 	nbio.remove(td.accept_retry); td.accept_retry = nil
 	nbio.remove(td.date_timer);   td.date_timer   = nil
 	nbio.remove(td.signal_timer); td.signal_timer = nil
+	nbio.remove(td.sweep_timer);  td.sweep_timer  = nil
 
 	start  := time.tick_now()
 	forced := false
@@ -331,6 +336,8 @@ _server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
 			}
 		}
 		if force { forced = true }
+
+		server_sweep_conns(td)
 
 		// Give up on connections that don't finish even after being shut down: their handler never
 		// responded and has no I/O pending. Their memory is leaked on purpose, the handler may
@@ -442,6 +449,14 @@ Connection :: struct {
 	// The in-flight write, see `connection_send`.
 	send_buf:       []byte,
 	send_done:      proc(c: ^Connection, ok: bool),
+
+	// Deadlines of the pending read / write, zero for none. The thread's sweeper (`server_sweep`)
+	// shuts the socket down once one passes, which fails the pending operation, and sets the
+	// matching `_expired` flag so the failure is reported as a timeout.
+	read_deadline:  time.Time,
+	write_deadline: time.Time,
+	read_expired:   bool,
+	write_expired:  bool,
 	// State of a pending "100 Continue" write.
 	continue_state: rawptr,
 	// Set once the connection is hijacked, see `response_hijack`.
@@ -472,12 +487,17 @@ connection_send :: proc(c: ^Connection, buf: []byte, done: proc(c: ^Connection, 
 	c.send_buf  = buf
 	c.send_done = done
 
-	timeout := c.server.opts.write_timeout if c.server.opts.write_timeout > 0 else nbio.NO_TIMEOUT
-	nbio.send_poly(c.socket, {c.send_buf}, c, on_sent, all = false, timeout = timeout)
+	send :: proc(c: ^Connection) {
+		wt := c.server.opts.write_timeout
+		c.write_deadline = time.time_add(nbio.now(), wt) if wt > 0 else {}
+		nbio.send_poly(c.socket, {c.send_buf}, c, on_sent, all = false)
+	}
+	send(c)
 
 	on_sent :: proc(op: ^nbio.Operation, c: ^Connection) {
-		if op.send.err != nil {
-			if op.send.err == net.TCP_Send_Error.Timeout {
+		c.write_deadline = {}
+		if op.send.err != nil || c.write_expired {
+			if c.write_expired || op.send.err == net.TCP_Send_Error.Timeout {
 				log.infof("write timed out on connection %i", c.socket)
 			} else {
 				log.debugf("could not send on connection %i: %v", c.socket, op.send.err)
@@ -491,8 +511,7 @@ connection_send :: proc(c: ^Connection, buf: []byte, done: proc(c: ^Connection, 
 
 		c.send_buf = c.send_buf[op.send.sent:]
 		if len(c.send_buf) > 0 {
-			timeout := c.server.opts.write_timeout if c.server.opts.write_timeout > 0 else nbio.NO_TIMEOUT
-			nbio.send_poly(c.socket, {c.send_buf}, c, on_sent, all = false, timeout = timeout)
+			send(c)
 			return
 		}
 
@@ -849,6 +868,56 @@ conn_handle_req :: proc(c: ^Connection, allocator := context.temp_allocator) {
 
 	c.scanner.max_token_size = c.server.opts.limit_request_line
 	scanner_scan(&c.scanner, &c.loop, on_rline1)
+}
+
+/*
+Timeouts are deadlines on the connection (`read_deadline`, `write_deadline`), checked by a timer per
+thread, instead of a timeout on every read and write: those cost an extra timer operation per I/O
+(io_uring: a linked timeout and its completion), measured at 10-25% of the throughput of small
+requests.
+
+A deadline fires up to `sweep_interval` late: a quarter of the shortest configured timeout, at most
+a second.
+*/
+@(private)
+server_sweep_start :: proc(td: ^Server_Thread) {
+	td.sweep_timer = nbio.timeout_poly(sweep_interval(td.server.opts), td, proc(_: ^nbio.Operation, td: ^Server_Thread) {
+		td.sweep_timer = nil
+		if td.state != .Serving { return }
+		server_sweep_conns(td)
+		server_sweep_start(td)
+	})
+}
+
+@(private)
+sweep_interval :: proc(opts: Server_Opts) -> time.Duration {
+	interval := time.Second
+	for t in ([]time.Duration{opts.idle_timeout, opts.header_timeout, opts.body_read_timeout, opts.write_timeout}) {
+		if t > 0 { interval = min(interval, t / 4) }
+	}
+	return max(interval, 5 * time.Millisecond)
+}
+
+// Shuts down the sockets of connections whose pending read or write is past its deadline.
+@(private)
+server_sweep_conns :: proc(td: ^Server_Thread) {
+	now := nbio.now()
+	for sock, c in td.conns {
+		if c.state == .Hijacked || c.state >= .Closing { continue }
+
+		if c.write_deadline != {} && time.diff(now, c.write_deadline) <= 0 {
+			c.write_deadline = {}
+			c.write_expired  = true
+			// Nothing more can be written (or read) usefully.
+			net.shutdown(sock, .Both)
+		}
+		if c.read_deadline != {} && time.diff(now, c.read_deadline) <= 0 {
+			c.read_deadline = {}
+			c.read_expired  = true
+			// Only the read side, so a 408 can still be sent.
+			net.shutdown(sock, .Receive)
+		}
+	}
 }
 
 // A buffer that will contain the date header for the current second.

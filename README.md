@@ -37,11 +37,19 @@ The *websocket* package links the system zlib for compression (`permessage-defla
 
 ## Performance
 
-Some small benchmarks have been done in the comparisons directory.
+`bench/http.sh` (HTTP, wrk) and `bench/ws.sh` (WebSocket) run in the Linux container; `bench/http.sh 5 2fe913b .`
+compares upstream's last commit with the working tree. Linux arm64 (OrbStack), 2 server threads, wrk on 2 other cores:
 
-My main priority in terms of performance is currently Linux (because most servers end up there in production).
+| | req/s | p99 |
+|---|---|---|
+| plaintext, 64 connections | ~600k | 0.2-1.2ms |
+| JSON | ~620k | 0.2-2.3ms |
+| 64 KiB responses | ~220k | 0.8-2.4ms |
+| 1 KiB POST echo | ~540-580k | 0.5-1.5ms |
+| 1 MiB static file | ~14k (~14 GiB/s) | 5ms |
 
-Other targets are still made to be performant, but benchmarking etc. is mostly done on Linux.
+Keep-alive throughput matches upstream; static files are about twice as fast. Throughput without keep-alive is
+too noisy on this VM to compare (100k-600k for either version).
 
 ## IO implementations
 

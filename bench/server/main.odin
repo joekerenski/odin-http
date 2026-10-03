@@ -15,6 +15,9 @@ import http "lib:http"
 
 BIG: string
 
+// Server threads, 0: one per core.
+THREADS :: #config(THREADS, 0)
+
 main :: proc() {
 	context.logger = log.create_console_logger(.Error)
 	BIG = strings.repeat("x", 64 * 1024)
@@ -53,6 +56,7 @@ main :: proc() {
 	})
 
 	opts := http.Default_Server_Opts
+	when THREADS > 0 { opts.thread_count = THREADS }
 	when #config(NO_TIMEOUTS, false) {
 		opts.idle_timeout      = -1
 		opts.header_timeout    = -1
