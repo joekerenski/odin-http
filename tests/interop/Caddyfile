@@ -1,0 +1,21 @@
+# Caddy in front of the interop server (scripts/interop.sh): TLS with Caddy's internal CA, HTTP/1.1
+# and HTTP/2 to clients, pooled HTTP/1.1 connections to the server. Otherwise default settings,
+# like a real deployment (X-Forwarded-For is replaced, not appended to, for untrusted clients).
+{
+	admin off
+	skip_install_trust
+	auto_https disable_redirects
+	storage file_system /tmp/caddy
+	log {
+		level ERROR
+	}
+}
+
+localhost:8443 {
+	tls internal
+	reverse_proxy 127.0.0.1:8080 {
+		# Needed with any fast upstream, see "Running behind Caddy" in the README: without it, about
+		# 1 in 50 concurrent POSTs fails (Caddy aborts the response).
+		request_buffers 64KB
+	}
+}

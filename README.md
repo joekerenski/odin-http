@@ -259,10 +259,34 @@ ws.dial("ws://localhost:8080/chat", {opts = {compression = true}}, {
 Connections live on one event loop thread; use `ws.handle(c)` with `ws.send_from_any_thread` / `ws.broadcast`
 from other threads.
 
+## Running behind Caddy
+
+The server speaks plain HTTP/1.1; put [Caddy](https://caddyserver.com) in front for TLS, HTTP/2 and
+HTTP/3. WebSockets go through as is. Tested with Caddy 2.11 (`scripts/interop.sh`).
+
+```caddyfile
+example.com {
+	reverse_proxy 127.0.0.1:8080 {
+		request_buffers 64KB
+	}
+}
+```
+
+- Listen on `127.0.0.1` (`net.IP4_Loopback`), so clients can't bypass Caddy.
+- `request_buffers` (any size) works around a race in Go's HTTP/1 server: with a fast upstream, about 1
+  in 50 concurrent POSTs gets an aborted response without it (Caddy logs "aborting with incomplete
+  response ... use of closed network connection"). Caddy's experimental `enable_full_duplex` server
+  option fixes it too.
+- Set `Rate_Limit_Opts.trusted_proxies = 1`, otherwise every client shares Caddy's address. Caddy
+  replaces the `X-Forwarded-For` a client sends, so it can't be spoofed.
+- Keep `Server_Opts.idle_timeout` (default 3 minutes) above Caddy's upstream keep-alive (2 minutes).
+- The WebSocket origin check works unchanged: Caddy forwards the `Host` header.
+
 ## Tests
 
 ```sh
 scripts/test.sh [--asan]                     # all suites (macOS / Linux)
 scripts/test-linux.sh [--asan] [--stress 5]  # Linux (io_uring) in docker, capped at 2 CPUs
 scripts/test-linux.sh --hunt 40              # repeat the stress tests until one fails, with thread dumps
+scripts/interop.sh                           # curl, Python and Caddy (TLS, HTTP/2) against a real server
 ```
