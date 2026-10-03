@@ -1,5 +1,9 @@
 # Odin HTTP
 
+> **Personal copy of [laytan/odin-http](https://github.com/laytan/odin-http)** by Laytan Laats, with the full original history.
+> It adds a hardened HTTP/1.1 server (see [audit/](audit/)) and a WebSocket server ([websocket/](websocket/)).
+> Not affiliated with or endorsed by the original project. All credit for the original library goes to its author.
+
 A HTTP/1.1 implementation for Odin purely written in Odin (besides SSL).
 
 See generated package documentation at [odin-http.laytan.dev](https://odin-http.laytan.dev).
