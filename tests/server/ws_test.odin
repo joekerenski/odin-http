@@ -358,9 +358,9 @@ ws_send_from_other_thread :: proc(t: ^testing.T) {
 	defer server_stop(ts)
 
 	c, _, ok := ws_dial(t, ts)
-	testing.expect(t, ok)
+	if !testing.expect(t, ok) { return }
 	defer net.close(c.sock)
-	sync.sema_wait(&cross_ready)
+	if !testing.expect(t, sync.sema_wait_with_timeout(&cross_ready, 2 * time.Second), "connection never opened") { return }
 
 	// From the test thread (not the server's event loop).
 	ws.broadcast({cross_handle, cross_handle}, .Text, transmute([]byte)string("from afar"))

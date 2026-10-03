@@ -17,7 +17,7 @@ This file is the working checklist. Finding IDs (S/F/C) refer to [REPORT.md](REP
 - [ ] **T6** Client test harness: crafted-response server (status, framing, TLS with a local CA, truncation, slow responses).
 - [ ] **T7** Interop: real curl / Python clients against the server; real servers against the client; Caddy in front of the server (docker) for the pooled-connection cases.
 - [x] **T8** CI: run all of the above on Linux, macOS and Windows; drop the non-compiling examples or fix them (S23). (4336bc3)
-  - The GitHub Actions workflow was removed on 2026-10-03 (this copy is macOS/Linux only); tests run locally, a Linux runner in docker replaces it.
+  - The GitHub Actions workflow was removed on 2026-10-03 (this copy is macOS/Linux only). Replaced by `scripts/test.sh [--asan]` (macOS/Linux) and `scripts/test-linux.sh [--asan]` (Linux arm64 in docker, io_uring). x86-64 Linux can't be tested on Apple silicon: Rosetta has no io_uring. Running the server in docker needs a seccomp profile that allows io_uring.
 
 ## Phase 1: Server crashes and framing (critical / high)
 

@@ -161,7 +161,12 @@ listen :: proc(
 	s.conn_allocator = context.allocator
 
 	if acquire_err := nbio.acquire_thread_event_loop(); acquire_err != nil {
-		log.errorf("could not acquire event loop: %v", acquire_err)
+		// The enum holds raw OS error codes, most have no name, so log the number.
+		when ODIN_OS == .Linux {
+			log.errorf("could not acquire event loop (os error %i): io_uring may be unavailable or blocked, e.g. by a container seccomp profile", i32(acquire_err))
+		} else {
+			log.errorf("could not acquire event loop (os error %i)", i32(acquire_err))
+		}
 		return net.Create_Socket_Error.Insufficient_Resources
 	}
 

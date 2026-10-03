@@ -46,7 +46,10 @@ server_start :: proc(t: ^testing.T, handler: http.Handler, opts := http.Default_
 }
 
 server_stop :: proc(ts: ^Test_Server) {
-	http.server_shutdown(&ts.server)
+	// A server that failed to listen never ran, there is nothing to shut down.
+	if ts.port != 0 {
+		http.server_shutdown(&ts.server)
+	}
 	thread.join(ts.thread)
 	thread.destroy(ts.thread)
 	free(ts)
