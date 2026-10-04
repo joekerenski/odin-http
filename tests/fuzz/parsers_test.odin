@@ -163,7 +163,17 @@ RESPONSE_SEEDS := []string{
 	"HTTP/1.1 304 Not Modified\r\nContent-Length: 10\r\n\r\n",
 }
 
-// The client's response parser on mutated responses, fed in random pieces.
+// What a streaming parse handed over.
+@(private="file")
+Fuzz_Stream :: struct {
+	heads:       int,
+	body_calls:  int,
+	body_before: bool, // body bytes came before the head
+	cancel:      bool, // on_body cancels on its third call
+}
+
+// The client's response parser on mutated responses, fed in random pieces; half of them in
+// streaming mode, where the head must come once and first and nothing may be collected.
 @(test)
 fuzz_client_response :: proc(t: ^testing.T) {
 	r := context.random_generator
@@ -178,6 +188,22 @@ fuzz_client_response :: proc(t: ^testing.T) {
 		_ = virtual.arena_init_growing(&arena)
 		p: client.Parser
 		client.parser_init(&p, opts, rand.int_max(8, r) == 0, virtual.arena_allocator(&arena), context.temp_allocator)
+		fs: Fuzz_Stream
+		streaming := rand.int_max(2, r) == 0
+		if streaming {
+			fs.cancel = rand.int_max(4, r) == 0
+			p.user_data = &fs
+			p.on_head = proc(p: ^client.Parser) -> bool {
+				(^Fuzz_Stream)(p.user_data).heads += 1
+				return true
+			}
+			p.on_body = proc(p: ^client.Parser, data: []byte) -> bool {
+				fs := (^Fuzz_Stream)(p.user_data)
+				if fs.heads == 0 { fs.body_before = true }
+				fs.body_calls += 1
+				return !(fs.cancel && fs.body_calls == 3)
+			}
+		}
 
 		buf := make([dynamic]byte, context.temp_allocator)
 		rest := input
@@ -193,6 +219,11 @@ fuzz_client_response :: proc(t: ^testing.T) {
 		}
 		if err == nil && p.state != .Done { err = client.parser_eof(&p) }
 
+		if streaming {
+			testing.expectf(t, fs.heads <= 1 && !fs.body_before && len(p.body) == 0, "streaming: %v heads, body first %v, collected %i, from %q", fs.heads, fs.body_before, len(p.body), input)
+			testing.expectf(t, err != .Cancelled || fs.cancel, "cancelled without asking, from %q", input)
+			if err == nil { testing.expectf(t, fs.heads == 1, "complete without a head, from %q", input) }
+		}
 		if err == nil {
 			testing.expectf(t, p.status >= 200 && p.status <= 999, "status %v from %q", p.status, input)
 			testing.expectf(t, len(p.body) <= opts.max_body_size, "body of %i from %q", len(p.body), input)

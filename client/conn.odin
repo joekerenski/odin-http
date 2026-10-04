@@ -57,13 +57,17 @@ Conn :: struct {
 	cb:          Callback,
 	user_data:   rawptr,
 	allocator:   mem.Allocator,
+
+	// A streamed response: the parser hands the head and body to these.
+	stream:      Stream,
+	stream_user: rawptr,
 }
 
 acquire_loop :: proc() -> nbio.General_Error { return nbio.acquire_thread_event_loop() }
 release_loop :: proc() { nbio.release_thread_event_loop() }
 tick_loop    :: proc() -> nbio.General_Error { return nbio.tick() }
 
-start :: proc(req: ^Request, url: string, opts: Opts, user_data: rawptr, cb: Callback, allocator: mem.Allocator) -> Error {
+start :: proc(req: ^Request, url: string, opts: Opts, user_data: rawptr, cb: Callback, allocator: mem.Allocator, stream := Stream{}, stream_user: rawptr = nil) -> Error {
 	t := parse_url(url, context.temp_allocator) or_return
 	request := format_request(req, t, !opts.disable_keep_alive, allocator) or_return
 
@@ -78,6 +82,8 @@ start :: proc(req: ^Request, url: string, opts: Opts, user_data: rawptr, cb: Cal
 	c.cb        = cb
 	c.user_data = user_data
 	c.allocator = allocator
+	c.stream      = stream
+	c.stream_user = stream_user
 	c.buf.allocator = allocator
 	c.out.allocator = allocator
 
@@ -93,6 +99,11 @@ start :: proc(req: ^Request, url: string, opts: Opts, user_data: rawptr, cb: Cal
 	c.tls_ca_file = clone_string(opts.tls_ca_file, arena)
 	if !opts.disable_keep_alive { c.key = origin_key(t, opts.tls_ca_file, arena) }
 	parser_init(&c.parser, opts, req.method == .Head, arena, allocator)
+	if stream.on_body != nil {
+		c.parser.on_head = on_stream_head
+		c.parser.on_body = on_stream_body
+		c.parser.user_data = c
+	}
 
 	if c.key != "" {
 		if ic, ok := pool_get(c.key); ok {
@@ -167,6 +178,28 @@ clone_string :: proc(s: string, allocator: mem.Allocator) -> string {
 
 time_left :: proc(c: ^Conn) -> time.Duration {
 	return max(time.diff(nbio.now(), c.deadline), time.Millisecond)
+}
+
+// How long one read may wait: what's left of the deadline, at most `stall_timeout`.
+read_timeout :: proc(c: ^Conn) -> time.Duration {
+	t := time_left(c)
+	if c.opts.stall_timeout > 0 { t = min(t, c.opts.stall_timeout) }
+	return t
+}
+
+// The head of a streamed response is in. From here only `stall_timeout` bounds the wait: the body
+// may keep coming for as long as it does.
+on_stream_head :: proc(p: ^Parser) -> bool {
+	c := (^Conn)(p.user_data)
+	c.deadline = time.time_add(nbio.now(), 365 * 24 * time.Hour)
+	if c.stream.on_head == nil { return true }
+	p.headers.readonly = true
+	return c.stream.on_head(http.Status(p.status), p.headers, c.stream_user)
+}
+
+on_stream_body :: proc(p: ^Parser, data: []byte) -> bool {
+	c := (^Conn)(p.user_data)
+	return c.stream.on_body(data, c.stream_user)
 }
 
 expired :: proc(c: ^Conn) -> bool {
@@ -256,7 +289,7 @@ read_cipher :: proc(c: ^Conn, next: proc(c: ^Conn)) {
 		}
 		openssl.BIO_write(c.rbio, raw_data(c.cin), i32(op.recv.received))
 		c.after_flush(c)
-	}, timeout = time_left(c))
+	}, timeout = read_timeout(c))
 }
 
 // --- Request ---
@@ -327,7 +360,7 @@ read_response :: proc(c: ^Conn) {
 		non_zero_resize(&c.buf, len(c.buf) + op.recv.received)
 		c.got_bytes = true
 		feed(c)
-	}, timeout = time_left(c))
+	}, timeout = read_timeout(c))
 }
 
 read_tls :: proc(c: ^Conn) {

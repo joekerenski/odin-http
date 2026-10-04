@@ -34,6 +34,11 @@ and tell it when the stream ended (`parser_eof`). Never panics on any input.
 Header names are lower-cased, repeated headers are joined with ", " (Set-Cookie goes to `cookies`
 instead). Header names and values, Content-Length, Transfer-Encoding and chunk sizes are checked
 with the server's strict parsers.
+
+Streaming: with `on_body` set, the body is handed over as it is decoded instead of collected in
+`body`, and `max_body_size` limits a single chunk rather than the whole body. `on_head` is called
+once the final response's head is complete, before any of its body. Either returning false stops
+the parse with `.Cancelled`.
 */
 Parser :: struct {
 	// Configuration.
@@ -60,6 +65,10 @@ Parser :: struct {
 	interim:         int,
 	// Headers, cookies and trailers.
 	arena:           mem.Allocator,
+
+	on_head:         proc(p: ^Parser) -> bool,
+	on_body:         proc(p: ^Parser, data: []byte) -> bool,
+	user_data:       rawptr,
 }
 
 parser_init :: proc(p: ^Parser, opts: Opts, head_request: bool, arena: mem.Allocator, body_allocator: mem.Allocator) {
@@ -105,20 +114,32 @@ parser_feed :: proc(p: ^Parser, data: []byte) -> (consumed: int, err: Error) {
 		case .Body_Length, .Chunk_Data:
 			n := min(p.left, len(data) - pos)
 			if n == 0 { return pos, .None }
-			append(&p.body, ..data[pos:pos + n])
+			body_bytes(p, data[pos:pos + n]) or_return
 			pos += n
 			p.left -= n
 			if p.left == 0 { p.state = .Done if p.state == .Body_Length else .Chunk_Data_End }
 
 		case .Body_Close:
-			if len(p.body) + len(data) - pos > p.max_body_size { return pos, .Response_Too_Large }
-			append(&p.body, ..data[pos:])
+			if pos == len(data) { return pos, .None }
+			if p.on_body == nil && len(p.body) + len(data) - pos > p.max_body_size { return pos, .Response_Too_Large }
+			body_bytes(p, data[pos:]) or_return
 			return len(data), .None
 
 		case .Done:
 		}
 	}
 	return pos, .None
+}
+
+// Body bytes: collected, or handed to `on_body` when streaming.
+@(private)
+body_bytes :: proc(p: ^Parser, data: []byte) -> Error {
+	if p.on_body != nil {
+		if !p.on_body(p, data) { return .Cancelled }
+		return .None
+	}
+	append(&p.body, ..data)
+	return .None
 }
 
 // The stream ended. Fine for a body delimited by the connection closing, an error otherwise.
@@ -227,9 +248,16 @@ add_field :: proc(p: ^Parser, line: string, trailer: bool) -> Error {
 }
 
 // The end of the header section: interim responses start over, otherwise the body's framing is
-// decided (RFC 9112 6.3).
+// decided (RFC 9112 6.3) and a streaming parse reports the head.
 @(private)
 headers_done :: proc(p: ^Parser) -> Error {
+	body_framing(p) or_return
+	if p.status >= 200 && p.on_head != nil && !p.on_head(p) { return .Cancelled }
+	return .None
+}
+
+@(private)
+body_framing :: proc(p: ^Parser) -> Error {
 	if p.status < 200 {
 		// 101 Switching Protocols: we never ask for an upgrade.
 		if p.status == 101 { return .Invalid_Response }
@@ -257,12 +285,12 @@ headers_done :: proc(p: ^Parser) -> Error {
 	if cl, has := http.headers_get_unsafe(p.headers, "content-length"); has {
 		n, ok := http.parse_content_length(cl)
 		if !ok { return .Invalid_Response }
-		if n > p.max_body_size { return .Response_Too_Large }
+		if p.on_body == nil && n > p.max_body_size { return .Response_Too_Large }
 		if n == 0 {
 			p.state = .Done
 			return .None
 		}
-		reserve(&p.body, n)
+		if p.on_body == nil { reserve(&p.body, n) }
 		p.left = n
 		p.state = .Body_Length
 		return .None

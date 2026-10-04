@@ -201,15 +201,66 @@ proxy :: proc(req: ^http.Request, res: ^http.Response) {
 - TLS: certificate chain, host name (or IP address) and TLS ≥ 1.2 are always checked; there is no switch to
   turn that off. `Opts.tls_ca_file` trusts a private CA instead of the system store.
 - Responses are read completely, within `Opts.max_body_size` (16 MiB), `max_header_size` (64 KiB) and
-  `max_headers` (100). Chunked and Content-Length bodies, trailers in `res.trailers`, cookies in
-  `res.cookies`. A body that's cut short is an error, not a short body.
-- Deadlines: `connect_timeout` (10s) and `timeout` for the whole request (60s).
+  `max_headers` (100), unless streamed (below). Chunked and Content-Length bodies, trailers in
+  `res.trailers`, cookies in `res.cookies`. A body that's cut short is an error, not a short body.
+- Deadlines: `connect_timeout` (10s) and `timeout` for the whole request (60s); `stall_timeout` (off,
+  60s when streaming) bounds each wait for more of the response.
 - Connections are kept alive and reused per origin, across threads (`idle_timeout` 30s,
   `max_idle_per_host` 4, `disable_keep_alive`). A dead pooled connection is replaced transparently;
   idempotent requests (GET, HEAD, PUT, DELETE) are retried once if the server closed it as the request went out.
 - Requests are validated, not escaped: a header value with a line break or an invalid cookie is refused
   with `.Invalid_Request`.
 - Names are resolved with a blocking DNS lookup.
+
+### Streaming
+
+`request_stream` (blocking) and `request_stream_async` hand the body over as it arrives, for large
+downloads and streaming APIs. `on_head` sees the status and headers first; `on_body` gets each piece,
+its framing removed; either returning false cancels with `.Cancelled`. The body isn't kept, so
+`max_body_size` only limits a single chunk. `timeout` covers the request until its head arrives, then
+only `stall_timeout` applies: a reply may stream for minutes, a server that goes quiet still fails.
+
+`client.SSE` parses Server-Sent Events (`text/event-stream`) incrementally:
+
+```odin
+import "core:bytes"
+import "core:fmt"
+
+import http "libs:odin-http"
+import "libs:odin-http/client"
+
+complete :: proc(body: string) -> client.Error {
+	req: client.Request
+	client.request_init(&req, .Post)
+	defer client.request_destroy(&req)
+	http.headers_set(&req.headers, "authorization", "Bearer ...")
+	http.headers_set(&req.headers, "content-type", "application/json")
+	bytes.buffer_write_string(&req.body, body) // or client.with_json
+
+	sse: client.SSE
+	client.sse_init(&sse, proc(ev: client.SSE_Event, user_data: rawptr) -> bool {
+		if ev.data != "[DONE]" { fmt.println(ev.type, ev.data) } // one JSON delta per event
+		return true // false would stop reading (the request then ends with .Cancelled)
+	})
+	defer client.sse_destroy(&sse)
+
+	stream := client.Stream{
+		// Anything but 200: cancel, the request ends with .Cancelled.
+		on_head = proc(status: http.Status, headers: http.Headers, user_data: rawptr) -> bool {
+			return status == .OK
+		},
+		on_body = proc(data: []byte, user_data: rawptr) -> bool {
+			return client.sse_feed((^client.SSE)(user_data), data)
+		},
+	}
+	res, err := client.request_stream(&req, "https://api.example.com/v1/chat/completions", stream, &sse)
+	client.response_destroy(&res)
+	return err
+}
+```
+
+The callbacks run on the request's thread (`request_stream` runs it on a thread of its own and blocks
+the caller), so share their results with other threads through a mutex or a queue.
 
 ## WebSockets
 

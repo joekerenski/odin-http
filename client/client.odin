@@ -11,8 +11,10 @@ certificate and host name are always verified).
 handler, or anywhere else an nbio event loop runs, use `request_async`, which runs on the calling
 thread's event loop.
 
-Responses are read completely, within `Opts` limits. Connections are reused (keep-alive) unless
-`Opts.disable_keep_alive` is set.
+Responses are read completely, within `Opts` limits. To process a body as it arrives (a large
+download, Server-Sent Events from a streaming API), use `request_stream` / `request_stream_async`
+with a `Stream`; `SSE` (sse.odin) parses an event stream. Connections are reused (keep-alive)
+unless `Opts.disable_keep_alive` is set.
 */
 package client
 
@@ -31,10 +33,15 @@ Opts :: struct {
 	// Establishing the TCP connection, defaults to 10s.
 	connect_timeout: time.Duration,
 	// The whole request: connecting, TLS, sending the request and receiving the complete
-	// response. Defaults to 60s.
+	// response. Defaults to 60s. When streaming, only until the response head has arrived: a
+	// body that keeps coming can take as long as it takes (see `stall_timeout`).
 	timeout:         time.Duration,
+	// The longest wait for any single read, so a server that goes quiet fails even while the
+	// total `timeout` has time left. Off by default; 60s when streaming.
+	stall_timeout:   time.Duration,
 	// Limits on the response: status line and header section (and, separately, trailers) in
-	// bytes, defaults to 64 KiB; header count, defaults to 100; body, defaults to 16 MiB.
+	// bytes, defaults to 64 KiB; header count, defaults to 100; body, defaults to 16 MiB (when
+	// streaming: any one chunk of a chunked body, the body itself isn't kept).
 	max_header_size: int,
 	max_headers:     int,
 	max_body_size:   int,
@@ -89,6 +96,8 @@ Error :: enum u8 {
 	Response_Too_Large,
 	// A Transfer-Encoding other than chunked (the client never asks for one).
 	Unsupported_Encoding,
+	// A `Stream` callback returned false.
+	Cancelled,
 }
 
 Request :: struct {
@@ -211,6 +220,79 @@ request :: proc(req: ^Request, url: string, opts := Default_Opts, allocator := c
 	thread.join(t)
 	thread.destroy(t)
 	return b.res, b.err
+}
+
+/*
+Callbacks for a streamed response. Both run on the thread doing the request (the event loop's for
+`request_stream_async`, the request's own thread for `request_stream`) and get the request's
+`user_data`. Returning false cancels the request: it ends with `.Cancelled` and the connection is
+closed. Callbacks never run after the request's `Callback`, or after `request_stream` returned.
+*/
+Stream :: struct {
+	// The final response's status and headers (read-only, valid until the request ends), before
+	// any of its body. Optional.
+	on_head: proc(status: http.Status, headers: http.Headers, user_data: rawptr) -> bool,
+	// The body as it arrives, its framing removed, in order. `data` is only valid during the call.
+	on_body: proc(data: []byte, user_data: rawptr) -> bool,
+}
+
+/*
+`request_async`, with the body handed to `stream` as it arrives instead of collected: the response
+given to `cb` has the status, headers and trailers, and an empty body. `timeout` covers the request
+until its response head; after that `stall_timeout` (60s unless set) bounds each wait for more.
+*/
+request_stream_async :: proc(req: ^Request, url: string, opts: Opts, stream: Stream, user_data: rawptr, cb: Callback, allocator := context.allocator) -> Error {
+	assert(stream.on_body != nil, "client: a Stream needs on_body")
+	return start(req, url, stream_defaults(opts), user_data, cb, allocator, stream, user_data)
+}
+
+/*
+`request`, with the body handed to `stream` as it arrives (see `request_stream_async`). Blocks
+until the response is complete, cancelled or failed; the callbacks run on the request's own thread
+meanwhile, so data they share with other threads needs synchronizing. The returned response has
+an empty body.
+*/
+request_stream :: proc(req: ^Request, url: string, stream: Stream, user_data: rawptr, opts := Default_Opts, allocator := context.allocator) -> (res: Response, err: Error) {
+	assert(stream.on_body != nil, "client: a Stream needs on_body")
+	Blocking :: struct {
+		req:       ^Request,
+		url:       string,
+		opts:      Opts,
+		stream:    Stream,
+		user_data: rawptr,
+		allocator: mem.Allocator,
+		res:       Response,
+		err:       Error,
+		done:      bool,
+	}
+	b := Blocking{req = req, url = url, opts = opts, stream = stream, user_data = user_data, allocator = allocator}
+
+	t := thread.create_and_start_with_poly_data(&b, proc(b: ^Blocking) {
+		if err := acquire_loop(); err != nil {
+			b.err = .Network_Error
+			return
+		}
+		defer release_loop()
+
+		b.err = start(b.req, b.url, stream_defaults(b.opts), b, proc(res: Response, err: Error, user_data: rawptr) {
+			b := (^Blocking)(user_data)
+			b.res, b.err, b.done = res, err, true
+		}, b.allocator, b.stream, b.user_data)
+		if b.err != nil { return }
+		for !b.done {
+			if tick_loop() != nil { break }
+		}
+	}, init_context = context)
+	thread.join(t)
+	thread.destroy(t)
+	return b.res, b.err
+}
+
+@(private)
+stream_defaults :: proc(opts: Opts) -> Opts {
+	o := with_defaults(opts)
+	if o.stall_timeout <= 0 { o.stall_timeout = 60 * time.Second }
+	return o
 }
 
 // A GET request, see `request`.
