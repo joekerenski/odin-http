@@ -5,6 +5,8 @@ import "core:mem"
 import "core:mem/virtual"
 import "core:net"
 
+import "openssl"
+
 /*
 A connection taken over from the HTTP server with `response_hijack`, e.g. for WebSockets.
 
@@ -18,7 +20,15 @@ completed (shutting the socket down with `net.shutdown(.Both)` makes pending ope
 Hijacked :: struct {
 	socket: net.TCP_Socket,
 	client: net.Endpoint,
+	// Set when the connection is TLS: the owner reads and writes through `ssl` from now on (its
+	// memory BIOs hold the ciphertext, `rbio` possibly some already received) and frees it.
+	tls:    Hijacked_TLS,
 	_conn:  ^Connection,
+}
+
+Hijacked_TLS :: struct {
+	ssl:        ^openssl.SSL,
+	rbio, wbio: ^openssl.BIO,
 }
 
 // Called once the response has been sent (ok) or failed to send (not ok, the connection is closed).
@@ -83,6 +93,12 @@ response_hijack :: proc(r: ^Response, user_data: rawptr, cb: Hijack_Callback, on
 
 		buffered := c.scanner.buf[c.scanner.start:c.scanner.end]
 		h := Hijacked{socket = c.socket, client = c.loop.req.client, _conn = c}
+		if t := c.tls; t != nil {
+			// The TLS session goes to the new owner, the rest of our TLS state is freed.
+			h.tls = {t.ssl, t.rbio, t.wbio}
+			t.ssl = nil
+			tls_conn_destroy(c)
+		}
 		c.loop = {}
 		hs.cb(hs.user_data, h, buffered, true)
 

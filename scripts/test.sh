@@ -90,7 +90,7 @@ check_examples() {
 	done
 }
 
-STRESS_NAMES=${STRESS_NAMES:-tests_server.stress_http,tests_server.stress_websocket,tests_server.stress_shutdown_under_load}
+STRESS_NAMES=${STRESS_NAMES:-tests_server.stress_http,tests_server.stress_websocket,tests_server.stress_shutdown_under_load,tests_server.stress_tls,tests_server.stress_tls_shutdown_under_load}
 
 echo "odin $(odin version | awk '{print $NF}') on $(uname -sm)"
 step "examples typecheck"     check_examples

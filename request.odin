@@ -17,6 +17,9 @@ Request :: struct {
 	trailers:   Headers,
 	url:        URL,
 	client:     net.Endpoint,
+	// The request came in over TLS (the server's own, see `Server_Opts.tls`; behind a proxy like
+	// Caddy this is false, the proxy speaks plain HTTP to the server).
+	tls:        bool,
 
 	// Route params/captures, in order, as received (not percent-decoded). See `url_param`.
 	url_params: []string,

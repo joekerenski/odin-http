@@ -1,7 +1,10 @@
 // Server for the interop tests (tests/interop/test_interop.py, run by scripts/interop.sh): real
 // clients (curl, Python, Caddy as a reverse proxy) against the endpoints below.
 //
-//	interop <port> <file>   <file> is served at /file (ranges, conditional requests)
+//	interop <port> <file> [<tls port> <cert> <key>]
+//
+// <file> is served at /file (ranges). With a TLS port the same routes are also served over the
+// server's own TLS (HSTS on), for testing it without Caddy.
 package interop_server
 
 import "core:fmt"
@@ -11,6 +14,7 @@ import "core:mem"
 import "core:net"
 import "core:os"
 import "core:strconv"
+import "core:thread"
 import "core:time"
 
 import http "../../.."
@@ -21,7 +25,7 @@ file_path: string
 main :: proc() {
 	context.logger = log.create_console_logger(.Debug if os.get_env("DEBUG", context.temp_allocator) != "" else .Warning)
 	if len(os.args) < 3 {
-		fmt.eprintln("usage: interop <port> <file>")
+		fmt.eprintln("usage: interop <port> <file> [<tls port> <cert> <key>]")
 		os.exit(2)
 	}
 	port, _ := strconv.parse_int(os.args[1])
@@ -103,6 +107,21 @@ main :: proc() {
 	opts.max_body_size = 32 * mem.Megabyte
 	// Shorter than Caddy's pool idle timeout (2 minutes), so the tests see the server closing pooled connections.
 	opts.idle_timeout = 2 * time.Second
-	err := http.listen_and_serve(&s, http.router_handler(&router), net.Endpoint{address = net.IP4_Loopback, port = port}, opts)
+
+	handler := http.router_handler(&router)
+	if len(os.args) >= 6 {
+		tls_port, _ := strconv.parse_int(os.args[3])
+		tls_opts := opts
+		tls_opts.tls = http.TLS_Opts{cert_file = os.args[4], key_file = os.args[5], hsts_max_age = 24 * time.Hour}
+		TLS_Server :: struct { s: http.Server, handler: http.Handler, port: int, opts: http.Server_Opts }
+		ts := new(TLS_Server)
+		ts^ = {handler = handler, port = tls_port, opts = tls_opts}
+		thread.create_and_start_with_poly_data(ts, proc(ts: ^TLS_Server) {
+			err := http.listen_and_serve(&ts.s, ts.handler, net.Endpoint{address = net.IP4_Loopback, port = ts.port}, ts.opts)
+			if err != nil { fmt.eprintln("listen (TLS):", err) }
+		}, context)
+	}
+
+	err := http.listen_and_serve(&s, handler, net.Endpoint{address = net.IP4_Loopback, port = port}, opts)
 	if err != nil { fmt.eprintln("listen:", err) }
 }

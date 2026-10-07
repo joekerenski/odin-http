@@ -16,6 +16,8 @@ import "core:sync"
 import "core:thread"
 import "core:time"
 
+import "openssl"
+
 Server_Opts :: struct {
 	// Whether the server should accept every request that sends a "Expect: 100-continue" header automatically.
 	// The interim 100 response is sent when the handler starts reading the body.
@@ -67,6 +69,9 @@ Server_Opts :: struct {
 	// How long a graceful shutdown waits for active requests before forcefully closing their
 	// connections. Defaults to 30 seconds.
 	shutdown_timeout:        time.Duration,
+
+	// Serve HTTPS: the certificate and key files, see `TLS_Opts`. Plain HTTP when nil.
+	tls:                     Maybe(TLS_Opts),
 }
 
 Default_Server_Opts := Server_Opts {
@@ -109,6 +114,11 @@ Server :: struct {
 	threads_closed: sync.Wait_Group,
 	// Open connections across all threads, used for `max_connections`.
 	conn_count:     Atomic(int),
+	// The listening socket was shut down (Linux, see `_server_thread_shutdown`).
+	listener_shut:  Atomic(bool),
+	// Guards the threads' `event_loop` against `server_shutdown` waking a loop that is going away.
+	wake_mu:        sync.Mutex,
+	tls:            Server_TLS,
 }
 
 Server_Thread :: struct {
@@ -129,6 +139,8 @@ Server_Thread :: struct {
 	date_timer:   ^nbio.Operation,
 	signal_timer: ^nbio.Operation,
 	sweep_timer:  ^nbio.Operation,
+	// Checks the TLS certificate files for changes (first thread only).
+	tls_timer:    ^nbio.Operation,
 }
 
 @(private, disabled = ODIN_DISABLE_ASSERT)
@@ -148,7 +160,7 @@ listen :: proc(
 	s: ^Server,
 	endpoint: net.Endpoint = Default_Endpoint,
 	opts: Server_Opts = Default_Server_Opts,
-) -> (err: net.Network_Error) {
+) -> (err: Listen_Error) {
 	s.opts = opts
 	// Zero values mean "use the default", so a partially filled `Server_Opts{...}` stays safe.
 	if s.opts.limit_request_line <= 0 { s.opts.limit_request_line = Default_Server_Opts.limit_request_line }
@@ -163,6 +175,10 @@ listen :: proc(
 	if s.opts.shutdown_timeout   == 0 { s.opts.shutdown_timeout   = Default_Server_Opts.shutdown_timeout }
 	s.conn_allocator = context.allocator
 
+	if tls_opts, has_tls := s.opts.tls.?; has_tls {
+		server_tls_init(s, tls_opts) or_return
+	}
+
 	if acquire_err := nbio.acquire_thread_event_loop(); acquire_err != nil {
 		// The enum holds raw OS error codes, most have no name, so log the number.
 		when ODIN_OS == .Linux {
@@ -170,14 +186,18 @@ listen :: proc(
 		} else {
 			log.errorf("could not acquire event loop (os error %i)", i32(acquire_err))
 		}
-		return net.Create_Socket_Error.Insufficient_Resources
+		server_tls_destroy(s)
+		return net.Network_Error(net.Create_Socket_Error.Insufficient_Resources)
 	}
 
-	s.tcp_sock, err = nbio.listen_tcp(endpoint)
-	if err != nil {
+	sock, listen_err := nbio.listen_tcp(endpoint)
+	if listen_err != nil {
 		nbio.release_thread_event_loop()
+		server_tls_destroy(s)
 		atomic_store(&s.closing, true)
+		return listen_err
 	}
+	s.tcp_sock = sock
 	return
 }
 
@@ -206,6 +226,7 @@ serve :: proc(s: ^Server, h: Handler) -> (err: net.Network_Error) {
 	net.close(s.tcp_sock)
 	for t in s.threads[1:] { thread.destroy(t.thread) }
 	delete(s.threads, s.conn_allocator)
+	server_tls_destroy(s)
 
 	return nil
 }
@@ -215,9 +236,10 @@ listen_and_serve :: proc(
 	h: Handler,
 	endpoint: net.Endpoint = Default_Endpoint,
 	opts: Server_Opts = Default_Server_Opts,
-) -> (err: net.Network_Error) {
+) -> (err: Listen_Error) {
 	listen(s, endpoint, opts) or_return
-	return serve(s, h)
+	if serr := serve(s, h); serr != nil { return serr }
+	return nil
 }
 
 _server_thread_init :: proc(s: ^Server, ttd: ^Server_Thread) {
@@ -241,6 +263,9 @@ _server_thread_init :: proc(s: ^Server, ttd: ^Server_Thread) {
 	// Start keeping track of and caching the date for the required date header.
 	server_date_start(td)
 	server_sweep_start(td)
+	if s.tls.enabled && td == &s.threads[0] {
+		server_tls_reload_start(td)
+	}
 
 	if td == &s.threads[0] && atomic_load(&on_interrupt_server) == s {
 		_server_watch_interrupts(td)
@@ -288,6 +313,9 @@ SHUTDOWN_INTERVAL :: time.Millisecond * 100
 //
 // Safe to call from any thread.
 server_shutdown :: proc(s: ^Server) {
+	// A thread can see `closing` on its own and finish before it's woken here: it clears its
+	// `event_loop` under the same lock before releasing the loop, so none is woken after it's gone.
+	sync.guard(&s.wake_mu)
 	atomic_store(&s.closing, true)
 	for t in s.threads {
 		if t.event_loop != nil {
@@ -302,11 +330,24 @@ _server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
 	td.state = .Closing
 	defer delete(td.conns)
 
-	nbio.remove(td.accept);       td.accept       = nil
+	when ODIN_OS == .Linux {
+		// Not `nbio.remove`: with io_uring the kernel may have accepted a connection already, and a
+		// cancelled accept drops it without a callback (the client would wait on a socket nobody
+		// owns). Shutting the listening socket down makes pending accepts fail instead; one that
+		// accepted in the meantime is closed in `on_accept`.
+		if !sync.atomic_exchange(&s.listener_shut.raw, true) {
+			net.shutdown(s.tcp_sock, .Both)
+		}
+	} else {
+		// kqueue only accepts once the socket is readable: removing the operation loses nothing.
+		nbio.remove(td.accept)
+		td.accept = nil
+	}
 	nbio.remove(td.accept_retry); td.accept_retry = nil
 	nbio.remove(td.date_timer);   td.date_timer   = nil
 	nbio.remove(td.signal_timer); td.signal_timer = nil
 	nbio.remove(td.sweep_timer);  td.sweep_timer  = nil
+	nbio.remove(td.tls_timer);    td.tls_timer    = nil
 
 	start  := time.tick_now()
 	forced := false
@@ -365,6 +406,10 @@ _server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
 	td.state = .Cleaning
 
 	nbio.run()
+	{
+		sync.guard(&s.wake_mu)
+		td.event_loop = nil
+	}
 	nbio.release_thread_event_loop()
 
 	td.state = .Closed
@@ -461,6 +506,11 @@ Connection :: struct {
 	write_deadline: time.Time,
 	read_expired:   bool,
 	write_expired:  bool,
+
+	// TLS state, nil for plain HTTP (and once hijacked: the new owner has it).
+	tls:            ^TLS_Conn,
+	// The pending plain read, see `connection_recv`.
+	recv_done:      Recv_Done,
 	// State of a pending "100 Continue" write.
 	continue_state: rawptr,
 	// Set once the connection is hijacked, see `response_hijack`.
@@ -485,6 +535,10 @@ connection_send :: proc(c: ^Connection, buf: []byte, done: proc(c: ^Connection, 
 
 	if len(buf) == 0 {
 		done(c, true)
+		return
+	}
+	if c.tls != nil {
+		tls_send(c, buf, done)
 		return
 	}
 
@@ -539,10 +593,28 @@ connection_close :: proc(c: ^Connection, loc := #caller_location) {
 	c.state = .Closing
 
 	// RFC 9112 9.6: close the write side first, then wait a little bit, allowing the client
-	// to process the closing and receive any remaining data.
-	net.shutdown(c.socket, net.Shutdown_Manner.Send)
+	// to process the closing and receive any remaining data. With TLS, a close_notify goes first.
+	if c.tls != nil {
+		tls_close(c)
+	} else {
+		net.shutdown(c.socket, net.Shutdown_Manner.Send)
+	}
 
-	nbio.timeout_poly(Conn_Close_Delay, c, proc(_: ^nbio.Operation, c: ^Connection) {
+	nbio.timeout_poly(Conn_Close_Delay, c, connection_finish_close)
+}
+
+// Closes the socket and frees the connection, once the TLS layer has nothing in flight.
+@(private)
+connection_finish_close :: proc(_: ^nbio.Operation, c: ^Connection) {
+	if tls_busy(c) {
+		// Make the pending TLS operation fail (e.g. a close_notify the client doesn't read), then retry.
+		net.shutdown(c.socket, .Both)
+		nbio.timeout_poly(20 * time.Millisecond, c, connection_finish_close)
+		return
+	}
+	tls_conn_destroy(c)
+
+	{
 		nbio.close_poly(c.socket, c, proc(_: ^nbio.Operation, c: ^Connection) {
 			log.debugf("closed connection: %i", c.socket)
 
@@ -560,7 +632,7 @@ connection_close :: proc(c: ^Connection, loc := #caller_location) {
 				server_accept(td)
 			}
 		})
-	})
+	}
 }
 
 // Starts accepting a connection on the given server thread, unless the connection limit is reached,
@@ -613,6 +685,12 @@ on_accept :: proc(op: ^nbio.Operation, server: ^Server) {
 		return
 	}
 
+	if atomic_load(&server.closing) {
+		// Accepted while the server shuts down: the client gets a closed connection, not a hang.
+		net.close(op.accept.client)
+		return
+	}
+
 	sync.atomic_add(&server.conn_count.raw, 1)
 
 	// Accept next connection.
@@ -627,6 +705,17 @@ on_accept :: proc(op: ^nbio.Operation, server: ^Server) {
 	c.server = server
 	c.socket = op.accept.client
 	c.loop.req.client = op.accept.client_endpoint
+
+	if server.tls.enabled {
+		c.tls = tls_conn_new(c)
+		if c.tls == nil {
+			log.errorf("TLS: could not set up connection %i: %s", c.socket, openssl.error_string())
+			net.close(c.socket)
+			free(c, server.conn_allocator)
+			sync.atomic_sub(&server.conn_count.raw, 1)
+			return
+		}
+	}
 
 	td.conns[c.socket] = c
 
@@ -677,6 +766,9 @@ conn_handle_req :: proc(c: ^Connection, allocator := context.temp_allocator) {
 				log.debug("idle connection timed out")
 			} else if err == .EOF {
 				log.debugf("client disconnected (EOF)")
+			} else if l.conn.tls != nil && l.conn.tls.failed {
+				// Not TLS (plain HTTP on the HTTPS port, a scanner) or a client that hung up mid-handshake.
+				log.debug("TLS failed, closing")
 			} else if err == .Too_Long {
 				log.info("request-line too long")
 				l.req.line = Requestline{version = {1, 1}}
@@ -863,6 +955,7 @@ conn_handle_req :: proc(c: ^Connection, allocator := context.temp_allocator) {
 	c.loop.res._conn = c
 	c.loop.req._scanner = &c.scanner
 	request_init(&c.loop.req, allocator)
+	c.loop.req.tls = c.tls != nil
 	response_init(&c.loop.res, allocator)
 
 	// A fresh connection has `header_timeout` to send its first request, a keep-alive connection

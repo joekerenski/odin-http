@@ -31,7 +31,7 @@ docker run --rm \
 	--cap-add SYS_PTRACE \
 	-e DEBUG \
 	--ulimit nofile=65536:65536 \
-	-e STRESS_NAMES -e STRESS_EXTRA -e STEP_TIMEOUT -e MAX_LOG_MB \
+	-e STRESS_NAMES -e STRESS_EXTRA -e STEP_TIMEOUT -e MAX_LOG_MB -e HUNT_NAMES -e BUILD_EXTRA -e HUNT_GDB \
 	-v "$PWD:/src" \
 	"$IMAGE" \
 	"${CMD[@]}"

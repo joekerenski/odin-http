@@ -6,14 +6,18 @@ which sets:
     DIRECT  http://127.0.0.1:8080    the server
     PROXY   https://localhost:8443   Caddy in front of it (TLS, HTTP/2 to clients, pooled upstream)
     CA          Caddy's root certificate
+    DIRECT_TLS  https://localhost:8444, the server's own TLS
+    TLS_CA      the CA of its (test) certificate
     FILE        the file the server serves at /file
     ODIN_CLIENT tests/interop/client, the WebSocket and HTTP clients against Caddy
 """
 
 import asyncio
+import collections
 import concurrent.futures
 import hashlib
 import http.client
+import json
 import os
 import random
 import ssl
@@ -29,6 +33,8 @@ import websockets
 DIRECT = os.environ["DIRECT"]
 PROXY = os.environ["PROXY"]
 CA = os.environ["CA"]
+DIRECT_TLS = os.environ["DIRECT_TLS"]
+TLS_CA = os.environ["TLS_CA"]
 with open(os.environ["FILE"], "rb") as f:
     FILE_DATA = f.read()
 
@@ -40,19 +46,20 @@ def pattern(n):
     return (bytes(range(251)) * (n // 251 + 1))[:n]
 
 
-def tls_context():
-    return ssl.create_default_context(cafile=CA)
+def tls_context(ca=CA):
+    return ssl.create_default_context(cafile=ca)
 
 
 class Common:
     """Tests that run both directly and through Caddy (subclasses set `base`)."""
 
     base = ""
+    ca = CA
 
     def conn(self, timeout=30):
         u = urllib.parse.urlsplit(self.base)
         if u.scheme == "https":
-            return http.client.HTTPSConnection(u.hostname, u.port, timeout=timeout, context=tls_context())
+            return http.client.HTTPSConnection(u.hostname, u.port, timeout=timeout, context=tls_context(self.ca))
         return http.client.HTTPConnection(u.hostname, u.port, timeout=timeout)
 
     def request(self, method, path, body=None, headers=None, conn=None):
@@ -66,7 +73,7 @@ class Common:
                 c.close()
 
     def curl(self, *args):
-        p = subprocess.run(["curl", "-fsS", "--max-time", "30", "--cacert", CA, *args], capture_output=True, timeout=60)
+        p = subprocess.run(["curl", "-fsS", "--max-time", "30", "--cacert", self.ca, *args], capture_output=True, timeout=60)
         self.assertEqual(p.returncode, 0, p.stderr.decode())
         return p.stdout
 
@@ -74,7 +81,7 @@ class Common:
         return self.base.replace("http", "ws", 1) + path
 
     def ws_connect(self, **kw):
-        ssl_ctx = tls_context() if self.base.startswith("https") else None
+        ssl_ctx = tls_context(self.ca) if self.base.startswith("https") else None
         return websockets.connect(self.ws_url(), ssl=ssl_ctx, max_size=32 * MiB, open_timeout=10, close_timeout=10, **kw)
 
     # --- HTTP ---
@@ -271,6 +278,72 @@ class Direct(Common, unittest.TestCase):
     def test_stream_is_chunked(self):
         r, _ = self.request("GET", "/stream?n=10")
         self.assertEqual(r.getheader("transfer-encoding"), "chunked")
+
+
+class DirectTLS(Direct):
+    """Everything Direct does, over the server's own TLS (no Caddy)."""
+
+    base = DIRECT_TLS
+    ca = TLS_CA
+
+    def test_alpn_falls_back_to_http11(self):
+        """A client preferring HTTP/2 gets HTTP/1.1 (ALPN), not a broken connection."""
+        out = self.curl("--http2", "-o", "/dev/null", "-w", "%{http_version}", self.base + "/hello")
+        self.assertEqual(out, b"1.1")
+
+    def test_hsts(self):
+        r, _ = self.request("GET", "/hello")
+        self.assertEqual(r.getheader("strict-transport-security"), "max-age=86400")
+
+    def test_old_tls_refused(self):
+        """TLS 1.0 and 1.1 are refused (the client side is told to offer only them)."""
+        for version in (ssl.TLSVersion.TLSv1, ssl.TLSVersion.TLSv1_1):
+            ctx = tls_context(self.ca)
+            try:
+                ctx.minimum_version = version
+                ctx.maximum_version = version
+            except ValueError:
+                continue  # This Python/OpenSSL can't even offer it.
+            u = urllib.parse.urlsplit(self.base)
+            c = http.client.HTTPSConnection(u.hostname, u.port, timeout=10, context=ctx)
+            with self.assertRaises((ssl.SSLError, ConnectionError, OSError)):
+                c.request("GET", "/hello")
+                c.getresponse()
+            c.close()
+
+    def test_plain_http_on_tls_port(self):
+        """Plain HTTP to the TLS port: the connection is closed, the server carries on."""
+        u = urllib.parse.urlsplit(self.base)
+        p = subprocess.run(["curl", "-sS", "--max-time", "10", f"http://{u.hostname}:{u.port}/hello"], capture_output=True, timeout=30)
+        self.assertNotEqual(p.returncode, 0)
+        r, body = self.request("GET", "/hello")
+        self.assertEqual((r.status, body), (200, b"hello"))
+
+    def test_testssl(self):
+        """testssl.sh: protocols, ciphers, renegotiation and the known TLS vulnerabilities."""
+        u = urllib.parse.urlsplit(self.base)
+        with tempfile.TemporaryDirectory() as d:
+            report = os.path.join(d, "testssl.json")
+            subprocess.run(["testssl", "--quiet", "--color", "0", "--warnings", "off", "--add-ca", self.ca,
+                            "-p", "-U", "-R", "--jsonfile", report, f"{u.hostname}:{u.port}"],
+                           capture_output=True, timeout=300)
+            with open(report) as f:
+                findings = json.load(f)
+        sev = collections.Counter(f.get("severity") for f in findings)
+        summary = {f["id"]: f["finding"] for f in findings if f.get("id") in
+                   ("SSLv2", "SSLv3", "TLS1", "TLS1_1", "TLS1_2", "TLS1_3", "secure_renego", "secure_client_renego", "heartbleed", "CRIME_TLS", "BREACH", "ROBOT")}
+        notable = [f"{f['id']} ({f['severity']}): {f['finding']}" for f in findings if f.get("severity") in ("LOW", "MEDIUM", "WARN")]
+        print(f"\ntestssl: {len(findings)} findings {dict(sev)}", *(f"{k}: {v}" for k, v in summary.items()), *notable, sep="\n  ", file=sys.stderr)
+        # Anything LOW or worse, except the test certificate (self-made CA, 100 years) and the
+        # scanner's own environment (engine_problem).
+        bad = [f for f in findings
+               if f.get("severity") in ("LOW", "MEDIUM", "HIGH", "CRITICAL")
+               and not f.get("id", "").startswith("cert") and f.get("id") != "engine_problem"]
+        self.assertEqual(bad, [], "\n".join(f"{f['id']}: {f['finding']}" for f in bad))
+        offered = {f["id"]: f["finding"] for f in findings if f.get("id") in ("SSLv2", "SSLv3", "TLS1", "TLS1_1", "TLS1_2", "TLS1_3")}
+        for old in ("SSLv2", "SSLv3", "TLS1", "TLS1_1"):
+            self.assertIn("not offered", offered.get(old, "not offered"), offered)
+        self.assertIn("offered", offered.get("TLS1_2", ""), offered)
 
 
 class Proxy(Common, unittest.TestCase):

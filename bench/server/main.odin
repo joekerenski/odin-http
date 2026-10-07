@@ -18,6 +18,10 @@ BIG: string
 // Server threads, 0: one per core.
 THREADS :: #config(THREADS, 0)
 
+// HTTPS with this certificate and key (current version only, older ones have no TLS).
+TLS_CERT :: #config(TLS_CERT, "")
+TLS_KEY  :: #config(TLS_KEY, "")
+
 main :: proc() {
 	context.logger = log.create_console_logger(.Error)
 	BIG = strings.repeat("x", 64 * 1024)
@@ -57,6 +61,7 @@ main :: proc() {
 
 	opts := http.Default_Server_Opts
 	when THREADS > 0 { opts.thread_count = THREADS }
+	when TLS_CERT != "" { opts.tls = http.TLS_Opts{cert_file = TLS_CERT, key_file = TLS_KEY} }
 	when #config(NO_TIMEOUTS, false) {
 		opts.idle_timeout      = -1
 		opts.header_timeout    = -1

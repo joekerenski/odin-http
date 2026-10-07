@@ -63,9 +63,6 @@ Conn :: struct {
 	stream_user: rawptr,
 }
 
-acquire_loop :: proc() -> nbio.General_Error { return nbio.acquire_thread_event_loop() }
-release_loop :: proc() { nbio.release_thread_event_loop() }
-tick_loop    :: proc() -> nbio.General_Error { return nbio.tick() }
 
 start :: proc(req: ^Request, url: string, opts: Opts, user_data: rawptr, cb: Callback, allocator: mem.Allocator, stream := Stream{}, stream_user: rawptr = nil) -> Error {
 	t := parse_url(url, context.temp_allocator) or_return

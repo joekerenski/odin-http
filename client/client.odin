@@ -7,7 +7,7 @@ certificate and host name are always verified).
 	defer client.response_destroy(&res)
 	fmt.println(res.status, res.body)
 
-`request`/`get` block the calling thread (the request runs on a thread of its own). Inside an HTTP
+`request`/`get` block the calling thread (the request runs on the client's own thread). Inside an HTTP
 handler, or anywhere else an nbio event loop runs, use `request_async`, which runs on the calling
 thread's event loop.
 
@@ -24,7 +24,6 @@ import "core:io"
 import "core:mem"
 import "core:mem/virtual"
 import "core:strings"
-import "core:thread"
 import "core:time"
 
 import http ".."
@@ -183,48 +182,18 @@ request_async :: proc(req: ^Request, url: string, opts: Opts, user_data: rawptr,
 /*
 Sends `req` to `url` and waits for the complete response. Free it with `response_destroy`.
 
-The request runs on a thread of its own (with its own event loop), so this can be called from any
-thread, but it blocks the caller: in an HTTP handler use `request_async` instead.
+The request runs on the client's own thread and event loop (started on first use, shared by all
+blocking requests, with their connection pool), so this can be called from any thread, but it blocks
+the caller: in an HTTP handler use `request_async` instead.
 */
 request :: proc(req: ^Request, url: string, opts := Default_Opts, allocator := context.allocator) -> (res: Response, err: Error) {
-	Blocking :: struct {
-		req:       ^Request,
-		url:       string,
-		opts:      Opts,
-		allocator: mem.Allocator,
-		res:       Response,
-		err:       Error,
-		done:      bool,
-	}
-	b := Blocking{req = req, url = url, opts = opts, allocator = allocator}
-
-	t := thread.create_and_start_with_poly_data(&b, proc(b: ^Blocking) {
-		if err := acquire_loop(); err != nil {
-			b.err = .Network_Error
-			return
-		}
-		defer release_loop()
-
-		b.err = request_async(b.req, b.url, b.opts, b, proc(res: Response, err: Error, user_data: rawptr) {
-			b := (^Blocking)(user_data)
-			b.res, b.err, b.done = res, err, true
-		}, b.allocator)
-		if b.err != nil { return }
-		for !b.done {
-			if tick_loop() != nil {
-				// Not expected; the request's own timeouts bound this otherwise.
-				break
-			}
-		}
-	}, init_context = context)
-	thread.join(t)
-	thread.destroy(t)
-	return b.res, b.err
+	job := Job{req = req, url = url, opts = with_defaults(opts), allocator = allocator}
+	return run_blocking(&job)
 }
 
 /*
 Callbacks for a streamed response. Both run on the thread doing the request (the event loop's for
-`request_stream_async`, the request's own thread for `request_stream`) and get the request's
+`request_stream_async`, the client's own thread for `request_stream`) and get the request's
 `user_data`. Returning false cancels the request: it ends with `.Cancelled` and the connection is
 closed. Callbacks never run after the request's `Callback`, or after `request_stream` returned.
 */
@@ -248,44 +217,14 @@ request_stream_async :: proc(req: ^Request, url: string, opts: Opts, stream: Str
 
 /*
 `request`, with the body handed to `stream` as it arrives (see `request_stream_async`). Blocks
-until the response is complete, cancelled or failed; the callbacks run on the request's own thread
-meanwhile, so data they share with other threads needs synchronizing. The returned response has
-an empty body.
+until the response is complete, cancelled or failed; the callbacks run on the client's own thread
+meanwhile (see `request`), so data they share with other threads needs synchronizing, and they
+must not make blocking requests themselves. The returned response has an empty body.
 */
 request_stream :: proc(req: ^Request, url: string, stream: Stream, user_data: rawptr, opts := Default_Opts, allocator := context.allocator) -> (res: Response, err: Error) {
 	assert(stream.on_body != nil, "client: a Stream needs on_body")
-	Blocking :: struct {
-		req:       ^Request,
-		url:       string,
-		opts:      Opts,
-		stream:    Stream,
-		user_data: rawptr,
-		allocator: mem.Allocator,
-		res:       Response,
-		err:       Error,
-		done:      bool,
-	}
-	b := Blocking{req = req, url = url, opts = opts, stream = stream, user_data = user_data, allocator = allocator}
-
-	t := thread.create_and_start_with_poly_data(&b, proc(b: ^Blocking) {
-		if err := acquire_loop(); err != nil {
-			b.err = .Network_Error
-			return
-		}
-		defer release_loop()
-
-		b.err = start(b.req, b.url, stream_defaults(b.opts), b, proc(res: Response, err: Error, user_data: rawptr) {
-			b := (^Blocking)(user_data)
-			b.res, b.err, b.done = res, err, true
-		}, b.allocator, b.stream, b.user_data)
-		if b.err != nil { return }
-		for !b.done {
-			if tick_loop() != nil { break }
-		}
-	}, init_context = context)
-	thread.join(t)
-	thread.destroy(t)
-	return b.res, b.err
+	job := Job{req = req, url = url, opts = stream_defaults(opts), stream = stream, streaming = true, user_data = user_data, allocator = allocator}
+	return run_blocking(&job)
 }
 
 @(private)
@@ -342,15 +281,15 @@ format_request :: proc(req: ^Request, t: Target, keep_alive := false, allocator 
 		}
 	}
 
-	if _, has := http.headers_get(req.headers, "host"); !has {
+	if !http.headers_has_unsafe(req.headers, "host") {
 		strings.write_string(&sb, "host: ")
 		strings.write_string(&sb, t.host_header)
 		strings.write_string(&sb, "\r\n")
 	}
-	if _, has := http.headers_get(req.headers, "user-agent"); !has {
+	if !http.headers_has_unsafe(req.headers, "user-agent") {
 		strings.write_string(&sb, "user-agent: odin-http\r\n")
 	}
-	if _, has := http.headers_get(req.headers, "accept"); !has {
+	if !http.headers_has_unsafe(req.headers, "accept") {
 		strings.write_string(&sb, "accept: */*\r\n")
 	}
 	if !keep_alive { strings.write_string(&sb, "connection: close\r\n") }

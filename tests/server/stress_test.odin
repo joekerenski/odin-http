@@ -10,6 +10,7 @@ package tests_server
 // the container's CPU and memory and kills steps that run too long or log too much.
 // Heavier runs: -define:STRESS_SERVER_THREADS=4 -define:STRESS_WORKERS=12.
 
+import "core:bytes"
 import "core:fmt"
 import "core:io"
 import "core:log"
@@ -25,6 +26,7 @@ import "core:thread"
 import "core:time"
 
 import http "../.."
+import "../../client"
 import ws "../../websocket"
 
 STRESS_SECONDS :: #config(STRESS_SECONDS, 0)
@@ -663,4 +665,233 @@ stress_shutdown_under_load :: proc(t: ^testing.T) {
 	sync.atomic_store(&s.stop, true)
 	join_all(&threads)
 	log.infof("stress_shutdown_under_load: %i good exchanges before shutdown, shutdown took %v", s.exchanges, took)
+}
+
+// --- TLS ---
+
+@(private="file")
+stress_tls_opts :: proc() -> http.Server_Opts {
+	opts := stress_opts()
+	opts.tls = http.TLS_Opts{cert_file = TLS_DIR + "server_a.pem", key_file = TLS_DIR + "server_a.key"}
+	return opts
+}
+
+@(private="file")
+STRESS_CA :: TLS_DIR + "ca_a.pem"
+
+/*
+Rounds of concurrent HTTPS requests on this thread's event loop: every kind of response, with and
+without keep-alive (later rounds reuse earlier connections), and streamed downloads cancelled after
+their first piece (the server's TLS write then fails in the middle of a response).
+*/
+@(private="file")
+tls_client_session :: proc(s: ^Stress) {
+	if nbio.acquire_thread_event_loop() != nil { return }
+	defer nbio.release_thread_event_loop()
+	// Pooled connections belong to this event loop, which goes away after the session.
+	defer client.close_idle_connections()
+	for _ in 0 ..< 4 { tls_client_round(s) }
+}
+
+@(private="file")
+tls_client_round :: proc(s: ^Stress) {
+
+	Pending :: struct {
+		s:      ^Stress,
+		want:   string,
+		cancel: bool,
+		done:   bool,
+	}
+	batch := make([]Pending, 8, context.temp_allocator)
+	for &p in batch {
+		p.s = s
+		opts := client.Default_Opts
+		opts.tls_ca_file = STRESS_CA
+		opts.disable_keep_alive = rand.int_max(3) == 0
+		r: client.Request
+		path := "/plain"
+		switch rand.int_max(6) {
+		case 0:
+			client.request_init(&r, .Get, context.temp_allocator)
+			path, p.want = "/plain", "hello"
+		case 1:
+			client.request_init(&r, .Get, context.temp_allocator)
+			path, p.want = "/big", string(big_body[:])
+		case 2:
+			client.request_init(&r, .Post, context.temp_allocator)
+			body := random_text(rand.int_max(200_000))
+			bytes.buffer_write_string(&r.body, body)
+			path, p.want = "/echo", body
+		case 3:
+			client.request_init(&r, .Get, context.temp_allocator)
+			path, p.want = "/stream", "streamed body"
+		case 4:
+			client.request_init(&r, .Get, context.temp_allocator)
+			path, p.want = "/slow", "slow"
+		case 5:
+			client.request_init(&r, .Get, context.temp_allocator)
+			path, p.cancel = "/big", true
+		}
+		url := fmt.tprintf("https://localhost:%i%s", s.port, path)
+		on_done :: proc(res: client.Response, err: client.Error, user_data: rawptr) {
+			p := (^Pending)(user_data)
+			p.done = true
+			res := res
+			defer client.response_destroy(&res)
+			switch {
+			case p.cancel:
+				if err != .Cancelled { fail(p.s, "cancelled stream ended with %v", err) }
+			case err != nil:
+				fail(p.s, "https request: %v", err)
+			case res.body != p.want:
+				fail(p.s, "https response: %i bytes, want %i", len(res.body), len(p.want))
+			case:
+				sync.atomic_add(&p.s.exchanges, 1)
+			}
+		}
+		err: client.Error
+		if p.cancel {
+			err = client.request_stream_async(&r, url, opts, {on_body = proc(_: []byte, _: rawptr) -> bool { return false }}, &p, on_done)
+		} else {
+			err = client.request_async(&r, url, opts, &p, on_done)
+		}
+		if err != nil {
+			p.done = true
+			fail(s, "request_async: %v", err)
+		}
+	}
+	start := time.tick_now()
+	loop: for time.tick_since(start) < 15 * time.Second {
+		for p in batch { if !p.done { nbio.tick(10 * time.Millisecond); continue loop } }
+		break
+	}
+	for p in batch { if !p.done { fail(s, "https request never finished") ; break } }
+}
+
+// Connections that never finish a handshake: hang up, half a record, garbage, plaintext, a reset.
+@(private="file")
+tls_abort_session :: proc(s: ^Stress) {
+	c, ok := client_dial(s.port)
+	if !ok { return }
+	switch rand.int_max(5) {
+	case 0:
+		net.close(c.sock)
+	case 1:
+		send_all(c.sock, "\x16\x03\x01\x02\x00\x01\x00\x01\xfc\x03\x03")
+		close_rst(c.sock)
+	case 2:
+		send_all(c.sock, strings.concatenate({"\x16\x03\x03", random_text(rand.int_max(3000))}, context.temp_allocator))
+		net.close(c.sock)
+	case 3:
+		send_all(c.sock, "GET / HTTP/1.1\r\nHost: x\r\n\r\n")
+		client_fill(&c) // The server closes it.
+		net.close(c.sock)
+	case 4:
+		time.sleep(time.Duration(rand.int_max(50)) * time.Millisecond)
+		close_rst(c.sock)
+	}
+}
+
+// A wss:// session: echoes of random sizes, then a clean close.
+@(private="file")
+tls_ws_session :: proc(s: ^Stress) {
+	if nbio.acquire_thread_event_loop() != nil { return }
+	defer nbio.release_thread_event_loop()
+
+	Session :: struct {
+		s:      ^Stress,
+		msgs:   [dynamic]string,
+		got:    int,
+		closed: bool,
+	}
+	sess := Session{s = s}
+	sess.msgs.allocator = context.temp_allocator
+	for _ in 0 ..< 1 + rand.int_max(20) { append(&sess.msgs, random_text(rand.int_max(100_000))) }
+
+	_, err := ws.dial(fmt.tprintf("wss://localhost:%i/ws", s.port), {opts = {compression = rand.int_max(2) == 0}, tls_ca_file = STRESS_CA}, {
+		user_data = &sess,
+		on_open = proc(c: ^ws.Conn) {
+			sess := (^Session)(c.user_data)
+			for m in sess.msgs { ws.send_text(c, m) }
+		},
+		on_message = proc(c: ^ws.Conn, _: ws.Message_Kind, data: []byte) {
+			sess := (^Session)(c.user_data)
+			if sess.got < len(sess.msgs) && string(data) != sess.msgs[sess.got] { fail(sess.s, "wss echo %i differs", sess.got) }
+			sess.got += 1
+			sync.atomic_add(&sess.s.exchanges, 1)
+			if sess.got == len(sess.msgs) { ws.close(c) }
+		},
+		on_close = proc(c: ^ws.Conn, code: u16, reason: string) {
+			sess := (^Session)(c.user_data)
+			sess.closed = true
+			if code != 1000 { fail(sess.s, "wss closed with %v %s after %i/%i", code, reason, sess.got, len(sess.msgs)) }
+		},
+	})
+	if err != nil {
+		fail(s, "wss dial: %v", err)
+		return
+	}
+	for start := time.tick_now(); !sess.closed && time.tick_since(start) < 15 * time.Second; { nbio.tick(10 * time.Millisecond) }
+	if !sess.closed { fail(s, "wss session never closed") }
+}
+
+@(private="file")
+expect_healthy_tls :: proc(t: ^testing.T, ts: ^Test_Server, loc := #caller_location) {
+	res, err := client.get(fmt.tprintf("https://localhost:%i/plain", ts.port), {tls_ca_file = STRESS_CA, disable_keep_alive = true})
+	defer client.response_destroy(&res)
+	testing.expectf(t, err == nil && res.body == "hello", "server unhealthy after load: %v %q", err, res.body, loc = loc)
+}
+
+@(test)
+stress_tls :: proc(t: ^testing.T) {
+	if !stress_begin(t) { return }
+	s := Stress{t = t}
+	defer delete(s.ws_handles)
+	ts := server_start(t, stress_handler(&s), stress_tls_opts(), SERVER_THREADS)
+	defer server_stop(ts)
+	s.port = ts.port
+
+	threads := make([dynamic]^thread.Thread)
+	defer delete(threads)
+	run_workers(&s, HTTP_WORKERS, tls_client_session, &threads)
+	run_workers(&s, 2, tls_abort_session, &threads)
+	run_workers(&s, 2, tls_ws_session, &threads)
+	time.sleep(STRESS_SECONDS * time.Second)
+	sync.atomic_store(&s.stop, true)
+	join_all(&threads)
+
+	log.infof("stress_tls: %i good exchanges, %i failures", s.exchanges, s.failures)
+	testing.expect(t, s.exchanges > 0, "no exchange succeeded")
+	expect_drained(t, ts)
+	expect_healthy_tls(t, ts)
+}
+
+// Shuts a TLS server down in the middle of HTTPS, aborted handshakes and wss:// traffic.
+@(test)
+stress_tls_shutdown_under_load :: proc(t: ^testing.T) {
+	if !stress_begin(t) { return }
+	s := Stress{t = t}
+	defer delete(s.ws_handles)
+	opts := stress_tls_opts()
+	opts.shutdown_timeout = 500 * time.Millisecond
+	ts := server_start(t, stress_handler(&s), opts, SERVER_THREADS)
+	s.port = ts.port
+
+	threads := make([dynamic]^thread.Thread)
+	defer delete(threads)
+	run_workers(&s, max(HTTP_WORKERS / 2, 1), tls_client_session, &threads)
+	run_workers(&s, 1, tls_abort_session, &threads)
+	run_workers(&s, 1, tls_ws_session, &threads)
+	time.sleep(min(STRESS_SECONDS, 1) * time.Second)
+
+	sync.atomic_store(&s.lenient, true)
+	start := time.tick_now()
+	server_stop(ts)
+	took := time.tick_since(start)
+	testing.expectf(t, took < 5 * time.Second, "TLS shutdown under load took %v", took)
+
+	time.sleep(200 * time.Millisecond)
+	sync.atomic_store(&s.stop, true)
+	join_all(&threads)
+	log.infof("stress_tls_shutdown_under_load: %i good exchanges before shutdown, shutdown took %v", s.exchanges, took)
 }

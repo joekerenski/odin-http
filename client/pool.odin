@@ -12,12 +12,16 @@ import "../openssl"
 
 /*
 Idle connections, kept for later requests to the same origin (scheme, host, port, and CA file).
-Shared by all threads: a connection is only in the pool while nothing is in flight on it, and nbio
-keeps no per-socket state between operations (one-shot kqueue filters, io_uring), so the next
-request can use it from any event loop.
+
+One pool per thread: nbio sockets belong to the event loop that created them, so a connection is
+only ever reused on the thread (and event loop) it was opened on. The blocking `request`/`get` all
+run on the client's own thread (see background.odin), so they share one pool.
+
+A thread that stops using its event loop for good should call `close_idle_connections` first,
+otherwise its idle connections stay open until the process exits.
 */
 
-// Idle connections kept at most, over all origins.
+// Idle connections kept at most per thread, over all origins.
 MAX_IDLE_TOTAL :: 64
 
 @(private)
@@ -29,36 +33,50 @@ Idle_Conn :: struct {
 }
 
 @(private)
-pool: struct {
-	mu:    sync.Mutex,
+Pool :: struct {
 	// By origin key, the most recently used last.
 	conns: map[string][dynamic]Idle_Conn,
 	total: int,
-	stats: Stats,
 }
 
-// Connections opened and requests that reused one, since the start (for tests and tuning).
+@(private, thread_local)
+pool: Pool
+
+// Connections opened and requests that reused one, since the start, over all threads (for tests
+// and tuning).
 Stats :: struct {
 	dials:  int,
 	reused: int,
 }
 
+@(private)
+stats_dials: int
+@(private)
+stats_reused: int
+
 stats :: proc() -> Stats {
-	sync.guard(&pool.mu)
-	return pool.stats
+	return {sync.atomic_load(&stats_dials), sync.atomic_load(&stats_reused)}
 }
 
-// Closes all idle connections (they are closed after `Opts.idle_timeout` otherwise, checked lazily).
+/*
+Closes the calling thread's idle connections, and those of the client's own thread (used by the
+blocking `request`/`get`) unless called from it. They're also closed lazily after
+`Opts.idle_timeout`, when the thread uses the client again.
+*/
 close_idle_connections :: proc() {
-	sync.guard(&pool.mu)
+	pool_close_all()
+	background_close_idle()
+}
+
+@(private)
+pool_close_all :: proc() {
 	for key, &list in pool.conns {
 		for ic in list { idle_close(ic) }
 		delete(list)
 		delete(key, runtime.heap_allocator())
 	}
 	delete(pool.conns)
-	pool.conns = nil
-	pool.total = 0
+	pool = {}
 }
 
 @(private)
@@ -69,7 +87,6 @@ origin_key :: proc(t: Target, ca_file: string, allocator := context.temp_allocat
 // An idle connection to the origin that still looks usable, the most recently used first.
 @(private)
 pool_get :: proc(key: string) -> (ic: Idle_Conn, ok: bool) {
-	sync.guard(&pool.mu)
 	list, has := &pool.conns[key]
 	if !has { return }
 	now := time.tick_now()
@@ -78,7 +95,7 @@ pool_get :: proc(key: string) -> (ic: Idle_Conn, ok: bool) {
 		pool.total -= 1
 		if time.tick_diff(now, ic.expires) > 0 && idle_alive(ic) {
 			ok = true
-			pool.stats.reused += 1
+			sync.atomic_add(&stats_reused, 1)
 			break
 		}
 		idle_close(ic)
@@ -90,7 +107,6 @@ pool_get :: proc(key: string) -> (ic: Idle_Conn, ok: bool) {
 // Keeps `ic` for later, unless the origin or the pool is full.
 @(private)
 pool_put :: proc(key: string, ic: Idle_Conn, max_per_origin: int) {
-	sync.guard(&pool.mu)
 	pool_purge_expired()
 
 	if pool.total >= MAX_IDLE_TOTAL {
@@ -115,8 +131,7 @@ pool_put :: proc(key: string, ic: Idle_Conn, max_per_origin: int) {
 
 @(private)
 pool_record_dial :: proc() {
-	sync.guard(&pool.mu)
-	pool.stats.dials += 1
+	sync.atomic_add(&stats_dials, 1)
 }
 
 @(private="file")

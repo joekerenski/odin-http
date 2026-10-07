@@ -56,6 +56,22 @@ SSL_ERROR_WANT_WRITE  :: 3
 SSL_ERROR_SYSCALL     :: 5
 SSL_ERROR_ZERO_RETURN :: 6
 
+SSL_FILETYPE_PEM :: 1
+
+SSL_OP_NO_COMPRESSION   :: u64(1) << 17
+SSL_OP_SERVER_PREFERENCE :: u64(1) << 22
+SSL_OP_NO_RENEGOTIATION :: u64(1) << 30
+
+SSL_CTRL_MODE            :: 33
+SSL_MODE_RELEASE_BUFFERS :: 0x10
+
+SSL_TLSEXT_ERR_OK    :: 0
+SSL_TLSEXT_ERR_NOACK :: 3
+
+OPENSSL_NPN_NEGOTIATED :: 1
+
+ALPN_Select_Proc :: #type proc "c" (ssl: ^SSL, out: ^[^]u8, outlen: ^u8, input: [^]u8, inlen: c.uint, arg: rawptr) -> c.int
+
 foreign lib {
 	TLS_client_method :: proc() -> ^SSL_METHOD ---
 	SSL_CTX_new :: proc(method: ^SSL_METHOD) -> ^SSL_CTX ---
@@ -95,6 +111,18 @@ foreign lib {
 	SSL_do_handshake :: proc(ssl: ^SSL) -> c.int ---
 	SSL_shutdown :: proc(ssl: ^SSL) -> c.int ---
 	SSL_pending :: proc(ssl: ^SSL) -> c.int ---
+
+	// Server side.
+	TLS_server_method :: proc() -> ^SSL_METHOD ---
+	SSL_CTX_set_options :: proc(ctx: ^SSL_CTX, op: u64) -> u64 ---
+	SSL_CTX_set_cipher_list :: proc(ctx: ^SSL_CTX, list: cstring) -> c.int ---
+	SSL_CTX_use_certificate_chain_file :: proc(ctx: ^SSL_CTX, file: cstring) -> c.int ---
+	SSL_CTX_use_PrivateKey_file :: proc(ctx: ^SSL_CTX, file: cstring, type: c.int) -> c.int ---
+	SSL_CTX_check_private_key :: proc(ctx: ^SSL_CTX) -> c.int ---
+	SSL_CTX_set_alpn_select_cb :: proc(ctx: ^SSL_CTX, cb: ALPN_Select_Proc, arg: rawptr) ---
+	SSL_select_next_proto :: proc(out: ^[^]u8, outlen: ^u8, server: [^]u8, server_len: c.uint, client: [^]u8, client_len: c.uint) -> c.int ---
+	SSL_get0_alpn_selected :: proc(ssl: ^SSL, data: ^[^]u8, len: ^c.uint) ---
+	SSL_set_accept_state :: proc(ssl: ^SSL) ---
 
 	ERR_get_error :: proc() -> c.ulong ---
 	ERR_clear_error :: proc() ---

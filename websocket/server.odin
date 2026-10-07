@@ -145,7 +145,12 @@ on_hijacked :: proc(user: rawptr, h: http.Hijacked, buffered: []byte, ok: bool) 
 	c._h = h
 	c._socket = h.socket
 	c._temp = http.hijacked_temp_allocator(h)
-	c._release = proc(c: ^Conn) { http.hijacked_close(c._h) }
+	// An HTTPS server hands its TLS session over: reads and writes go through it from now on.
+	if h.tls.ssl != nil { tls_adopt(c, h.tls.ssl, h.tls.rbio, h.tls.wbio) }
+	c._release = proc(c: ^Conn) {
+		tls_destroy(c)
+		http.hijacked_close(c._h)
+	}
 	if c._write_timeout == 0 {
 		c._write_timeout = http.hijacked_server_opts(h).write_timeout
 	}

@@ -130,13 +130,20 @@ io_error_send :: proc(err: net.Send_Error) -> IO_Error {
 @(private)
 tls_init :: proc(c: ^Conn, ctx: ^openssl.SSL_CTX, host: string, is_ip: bool) -> bool {
 	ssl, rbio, wbio := openssl.client_ssl(ctx, host, is_ip) or_return
+	tls_adopt(c, ssl, rbio, wbio)
+	return true
+}
+
+// Takes over an established TLS session (client: after `tls_init`; server: handed over by the
+// HTTP server's hijack), `c` owns and frees it from now on.
+@(private)
+tls_adopt :: proc(c: ^Conn, ssl: ^openssl.SSL, rbio, wbio: ^openssl.BIO) {
 	t := new(Tls, c._allocator)
 	t.ssl, t.rbio, t.wbio = ssl, rbio, wbio
 	t.cin = make([]byte, TLS_READ_SIZE, c._allocator)
 	t.out.allocator = c._allocator
 	t.sending.allocator = c._allocator
 	c._tls = t
-	return true
 }
 
 @(private)

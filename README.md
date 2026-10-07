@@ -14,8 +14,9 @@ An HTTP/1.1 server, an HTTP(S) client and WebSockets for [Odin](https://odin-lan
 | `odin-http/websocket` | `websocket` | WebSockets (RFC 6455 + permessage-deflate): server upgrade and `ws://`/`wss://` client |
 | `odin-http/openssl` | `openssl` | OpenSSL 3 bindings used by the client and WebSocket TLS (you don't need to import it) |
 
-The server speaks plain HTTP; for HTTPS put [Caddy](#running-behind-caddy) in front of it. The clients
-speak TLS themselves and always verify certificates.
+The server speaks HTTP, and HTTPS with a certificate you give it ([HTTPS](#https)); or put
+[Caddy](#running-behind-caddy) in front for automatic certificates and HTTP/2/3. The clients speak TLS
+themselves and always verify certificates.
 
 ## State
 
@@ -25,10 +26,12 @@ speak TLS themselves and always verify certificates.
   [docs/ISSUES.md](docs/ISSUES.md).
 - **WebSockets**: server and client pass the full [Autobahn TestSuite](https://github.com/crossbario/autobahn-testsuite)
   (517/517 cases each, compression included).
+- **Server TLS**: TLS 1.2/1.3 through the system's OpenSSL, certificates reloaded when they're renewed;
+  `testssl.sh` reports nothing (no old protocols, no CBC, no renegotiation, no known vulnerabilities).
 - **Client**: verified TLS, strict response parsing with size limits, deadlines, keep-alive.
 - **Performance**: plaintext ~600k req/s with keep-alive on 2 threads (Linux arm64), WebSocket echo
   ~1.9M small messages/s on one thread. See [Performance](#performance).
-- Not here: HTTP/2 (Caddy does it for you), TLS in the server (same), Windows.
+- Not here: HTTP/2, automatic certificates (ACME; Caddy does both for you), Windows.
 
 ## Installation
 
@@ -205,8 +208,9 @@ proxy :: proc(req: ^http.Request, res: ^http.Response) {
   `res.trailers`, cookies in `res.cookies`. A body that's cut short is an error, not a short body.
 - Deadlines: `connect_timeout` (10s) and `timeout` for the whole request (60s); `stall_timeout` (off,
   60s when streaming) bounds each wait for more of the response.
-- Connections are kept alive and reused per origin, across threads (`idle_timeout` 30s,
-  `max_idle_per_host` 4, `disable_keep_alive`). A dead pooled connection is replaced transparently;
+- Connections are kept alive and reused per origin (`idle_timeout` 30s, `max_idle_per_host` 4,
+  `disable_keep_alive`). Each thread has its own pool (a socket stays on the event loop that opened
+  it); the blocking calls all run on the client's own thread, so they share one. A dead pooled connection is replaced transparently;
   idempotent requests (GET, HEAD, PUT, DELETE) are retried once if the server closed it as the request went out.
 - Requests are validated, not escaped: a header value with a line break or an invalid cookie is refused
   with `.Invalid_Request`.
@@ -259,8 +263,9 @@ complete :: proc(body: string) -> client.Error {
 }
 ```
 
-The callbacks run on the request's thread (`request_stream` runs it on a thread of its own and blocks
-the caller), so share their results with other threads through a mutex or a queue.
+The callbacks run on the request's thread (`request_stream` runs it on the client's own thread and
+blocks the caller), so share their results with other threads through a mutex or a queue, and don't
+make blocking requests from them.
 
 ## WebSockets
 
@@ -299,7 +304,36 @@ connect :: proc() {
   cross-site WebSocket hijacking); `ws.allow_any_origin` turns that off.
 - `wss://` verifies the server like the HTTP client does (`Dial_Opts.tls_ca_file` for a private CA).
 
+## HTTPS
+
+```odin
+opts := http.Default_Server_Opts
+opts.tls = http.TLS_Opts{
+	cert_file    = "/etc/letsencrypt/live/example.com/fullchain.pem",
+	key_file     = "/etc/letsencrypt/live/example.com/privkey.pem",
+	hsts_max_age = 365 * 24 * time.Hour, // optional
+}
+err := http.listen_and_serve(&s, handler, net.Endpoint{net.IP4_Any, 443}, opts)
+// err is .Setup_Failed (http.TLS_Error) when the certificate or key can't be used; the reason is logged.
+
+// Port 80: send everyone to HTTPS (308, method and body kept).
+http.listen_and_serve(&plain, http.redirect_to_https(), net.Endpoint{net.IP4_Any, 80})
+```
+
+- TLS 1.2 and 1.3 only; for TLS 1.2 only ECDHE with AES-GCM or ChaCha20-Poly1305 (Mozilla's "intermediate"
+  profile). No renegotiation, no compression, ALPN `http/1.1`.
+- The certificate files are checked every minute (`reload_interval`) and loaded again when they change,
+  so a certbot or lego renewal applies without a restart. A file that can't be loaded (half-written)
+  keeps the current certificate.
+- Everything else works the same over TLS: timeouts (a stalled handshake counts against
+  `header_timeout`), limits, static files, streaming, and WebSockets (`wss://` to the same server).
+  `req.tls` tells a handler the request came over TLS.
+- Get certificates with certbot or lego (Let's Encrypt). Not built in: ACME, several certificates by
+  host name (SNI), client certificates.
+
 ## Running behind Caddy
+
+Instead of the server's own TLS, or for HTTP/2/3 and certificates that renew themselves:
 
 The server speaks plain HTTP/1.1; [Caddy](https://caddyserver.com) in front gives you TLS (with automatic
 certificates), HTTP/2 and HTTP/3. WebSockets go through as is. Tested with Caddy 2.11 (`scripts/interop.sh`).
@@ -328,13 +362,16 @@ x86-64 emulation (Rosetta) doesn't implement io_uring.
 
 Linux arm64 (OrbStack), server on 2 threads, wrk on 2 other cores (`bench/http.sh`):
 
-| HTTP, keep-alive | req/s | p99 |
+| HTTP | req/s | p99 |
 |---|---|---|
-| plaintext, 64 connections | ~600k | 0.2-1.2ms |
+| plaintext, keep-alive, 64 connections | ~600k | 0.2-1.2ms |
 | JSON | ~620k | 0.2-2.3ms |
 | 64 KiB responses | ~220k | 0.8-2.4ms |
 | 1 KiB POST echo | ~540-580k | 0.5-1.5ms |
 | 1 MiB static file | ~14k (~14 GiB/s) | 5ms |
+| plaintext over TLS (server's own) | ~480-520k | 0.2-1.2ms |
+| a new connection per request | ~67k (upstream: about the same, with read errors) | 1-4ms |
+| a new TLS connection per request (full handshake) | ~13k | 1ms |
 
 WebSockets, one server thread (`bench/ws.sh`): ~1.9M echoes/s of 32 bytes (p50 0.56ms), ~650k of 4 KiB,
 ~110k compressed 4 KiB text, broadcasts to 1000 clients ~390k deliveries/s.

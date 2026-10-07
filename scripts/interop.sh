@@ -28,18 +28,20 @@ docker run --rm --cpus="${CPUS:-2}" --memory=2g --pids-limit=512 -e PYTHONDONTWR
 	echo '127.0.0.1 alias.test' >> /etc/hosts
 	head -c 3000000 /dev/urandom > /tmp/file.bin
 
-	/tmp/interop 8080 /tmp/file.bin > /tmp/server.log 2>&1 & srv=\$!
+	/tmp/interop 8080 /tmp/file.bin 8444 tests/server/testdata/tls/server_a.pem tests/server/testdata/tls/server_a.key > /tmp/server.log 2>&1 & srv=\$!
 	caddy run --config tests/interop/Caddyfile --adapter caddyfile > /tmp/caddy.log 2>&1 & caddy=\$!
 
 	# Wait for both (Caddy also issues its certificate).
 	for _ in \$(seq 100); do
 		curl -sf -o /dev/null http://127.0.0.1:8080/hello && [ -f /tmp/caddy/pki/authorities/local/root.crt ] \
 			&& curl -sf -o /dev/null --cacert /tmp/caddy/pki/authorities/local/root.crt https://localhost:8443/hello \
-			&& curl -sf -o /dev/null --cacert /tmp/caddy/pki/authorities/local/root.crt https://127.0.0.1:8446/hello && break
+			&& curl -sf -o /dev/null --cacert /tmp/caddy/pki/authorities/local/root.crt https://127.0.0.1:8446/hello \
+			&& curl -sf -o /dev/null --cacert tests/server/testdata/tls/ca_a.pem https://localhost:8444/hello && break
 		sleep 0.1
 	done
 
 	DIRECT=http://127.0.0.1:8080 PROXY=https://localhost:8443 CA=/tmp/caddy/pki/authorities/local/root.crt FILE=/tmp/file.bin ODIN_CLIENT=/tmp/interop-client \
+		DIRECT_TLS=https://localhost:8444 TLS_CA=tests/server/testdata/tls/ca_a.pem \
 		timeout -s KILL 400 python3 tests/interop/test_interop.py $TESTS 2>&1
 	rc=\$?
 

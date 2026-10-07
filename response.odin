@@ -269,6 +269,12 @@ _response_write_heading :: proc(r: ^Response, content_length: int) {
 		ws(b, "\r\n")
 	}
 
+	if conn.tls != nil && conn.server.tls.hsts != "" && !headers_has_unsafe(r.headers, "strict-transport-security") {
+		ws(b, "strict-transport-security: ")
+		ws(b, conn.server.tls.hsts)
+		ws(b, "\r\n")
+	}
+
 	if (
 		content_length > -1                              &&
 		!headers_has_unsafe(r.headers, "content-length") &&

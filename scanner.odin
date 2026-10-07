@@ -6,7 +6,6 @@ import "base:intrinsics"
 
 import "core:bufio"
 import "core:nbio"
-import "core:net"
 import "core:time"
 
 Scan_Callback :: #type proc(user_data: rawptr, token: string, err: bufio.Scanner_Error)
@@ -246,10 +245,12 @@ scanner_scan :: proc(
 	s.connection.read_deadline = deadline
 
 	assert_has_td()
-	nbio.recv_poly(s.connection.socket, {s.buf[s.end:len(s.buf)]}, s, scanner_on_read)
+	connection_recv(s.connection, s.buf[s.end:len(s.buf)], proc(c: ^Connection, received: int, status: Recv_Status) {
+		scanner_on_read(&c.scanner, received, status)
+	})
 }
 
-scanner_on_read :: proc(op: ^nbio.Operation, s: ^Scanner) {
+scanner_on_read :: proc(s: ^Scanner, received: int, status: Recv_Status) {
 	context.temp_allocator = virtual.arena_allocator(&s.connection.temp_allocator)
 
 	defer scanner_scan(s, s.user_data, s.callback)
@@ -262,36 +263,27 @@ scanner_on_read :: proc(op: ^nbio.Operation, s: ^Scanner) {
 		return
 	}
 
-	if op.recv.err != nil {
-		#partial switch op.recv.err.(net.TCP_Recv_Error) {
-		case .Connection_Closed, .Invalid_Argument:
-			// EBADF (bad file descriptor) happens when OS closes socket.
-			s._err = .EOF
-			return
-		case .Timeout:
-			s.timed_out = true
-			s._err = .Unknown
-			return
-		}
-
+	switch status {
+	case .Closed:
+		s._err = .EOF
+		return
+	case .Failed:
 		s._err = .Unknown
 		return
+	case .Ok:
 	}
 
 	// When n == 0, connection is closed or buffer is of length 0.
-	if op.recv.received == 0 {
+	if received == 0 {
 		s._err = .EOF
 		return
 	}
 
-	if op.recv.received < 0 || len(s.buf) - s.end < op.recv.received {
+	if received < 0 || len(s.buf) - s.end < received {
 		s._err = .Bad_Read_Count
 		return
 	}
 
-	s.end += op.recv.received
-	if op.recv.received > 0 {
-		s.successive_empty_token_count = 0
-		return
-	}
+	s.end += received
+	s.successive_empty_token_count = 0
 }
