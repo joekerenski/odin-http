@@ -177,7 +177,7 @@ client_async_concurrent :: proc(t: ^testing.T) {
 	ts := server_start(t, client_handler(), threads = 2)
 	defer server_stop(ts)
 
-	nbio.acquire_thread_event_loop()
+	if !testing.expect_value(t, nbio.acquire_thread_event_loop(), nil) { return }
 	defer nbio.release_thread_event_loop()
 
 	State :: struct { t: ^testing.T, done, ok: int }
@@ -394,7 +394,7 @@ client_keep_alive :: proc(t: ^testing.T) {
 
 	// Requests on an event loop share the pool too.
 	{
-		nbio.acquire_thread_event_loop()
+		if !testing.expect_value(t, nbio.acquire_thread_event_loop(), nil) { return }
 		defer nbio.release_thread_event_loop()
 		ports: [dynamic]string
 		ports.allocator = context.temp_allocator

@@ -85,11 +85,19 @@ fail :: proc(s: ^Stress, format: string, args: ..any) {
 }
 
 @(private="file")
-run_workers :: proc(s: ^Stress, n: int, work: proc(s: ^Stress), threads: ^[dynamic]^thread.Thread) {
+// `event_loop`: the worker keeps one nbio event loop for its lifetime, for sessions that don't need
+// their own (see `session_event_loop`).
+run_workers :: proc(s: ^Stress, n: int, work: proc(s: ^Stress), threads: ^[dynamic]^thread.Thread, event_loop := false) {
+	Worker :: struct { s: ^Stress, work: proc(s: ^Stress), event_loop: bool }
 	for _ in 0 ..< n {
-		th := thread.create_and_start_with_poly_data2(s, work, proc(s: ^Stress, work: proc(s: ^Stress)) {
+		th := thread.create_and_start_with_poly_data(Worker{s, work, event_loop}, proc(w: Worker) {
+			s, work := w.s, w.work
 			state := rand.create(rand.uint64())
 			context.random_generator = rand.default_random_generator(&state)
+			if w.event_loop {
+				if !session_event_loop(s) { return }
+			}
+			defer if w.event_loop { nbio.release_thread_event_loop() }
 			for !sync.atomic_load(&s.stop) {
 				work(s)
 				free_all(context.temp_allocator)
@@ -106,6 +114,22 @@ join_all :: proc(threads: ^[dynamic]^thread.Thread) {
 		thread.destroy(th)
 	}
 	clear(threads)
+}
+
+/*
+An event loop for a client session (or a whole worker). On Linux the kernel charges every io_uring
+ring to the user's locked-memory limit (`ulimit -l`) and only gives it back a while after the ring
+is destroyed, so sessions with their own loop in quick succession can run out (scripts/test.sh uses
+smaller rings for that); nbio then refuses the thread an event loop for good. That fails the test
+(rather than quietly running fewer sessions), and the worker backs off.
+*/
+@(private="file")
+session_event_loop :: proc(s: ^Stress) -> bool {
+	err := nbio.acquire_thread_event_loop()
+	if err == nil { return true }
+	fail(s, "no event loop for a client session: %v (io_uring rings count against `ulimit -l`)", err)
+	time.sleep(50 * time.Millisecond)
+	return false
 }
 
 // Waits until the server has no connections left, they were all closed by the clients.
@@ -516,9 +540,7 @@ ws_client_session :: proc(s: ^Stress) {
 		failed: bool,
 	}
 
-	nbio.acquire_thread_event_loop()
-	defer nbio.release_thread_event_loop()
-
+	// Runs on the worker's event loop (`run_workers(..., event_loop = true)`).
 	sess := Session{s = s, msgs = make([][]byte, 1 + rand.int_max(6), context.temp_allocator)}
 	for &m in sess.msgs {
 		size := rand.int_max(300) if rand.int_max(5) > 0 else rand.int_max(70000)
@@ -619,7 +641,7 @@ stress_websocket :: proc(t: ^testing.T) {
 	threads := make([dynamic]^thread.Thread)
 	defer delete(threads)
 	run_workers(&s, WS_WORKERS, ws_session, &threads)
-	run_workers(&s, max(WS_WORKERS / 2, 1), ws_client_session, &threads)
+	run_workers(&s, max(WS_WORKERS / 2, 1), ws_client_session, &threads, event_loop = true)
 	run_workers(&s, 1, broadcaster, &threads)
 	time.sleep(STRESS_SECONDS * time.Second)
 	sync.atomic_store(&s.stop, true)
@@ -686,7 +708,7 @@ their first piece (the server's TLS write then fails in the middle of a response
 */
 @(private="file")
 tls_client_session :: proc(s: ^Stress) {
-	if nbio.acquire_thread_event_loop() != nil { return }
+	if !session_event_loop(s) { return }
 	defer nbio.release_thread_event_loop()
 	// Pooled connections belong to this event loop, which goes away after the session.
 	defer client.close_idle_connections()
@@ -795,7 +817,7 @@ tls_abort_session :: proc(s: ^Stress) {
 // A wss:// session: echoes of random sizes, then a clean close.
 @(private="file")
 tls_ws_session :: proc(s: ^Stress) {
-	if nbio.acquire_thread_event_loop() != nil { return }
+	if !session_event_loop(s) { return }
 	defer nbio.release_thread_event_loop()
 
 	Session :: struct {

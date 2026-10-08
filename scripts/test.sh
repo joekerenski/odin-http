@@ -90,6 +90,11 @@ check_examples() {
 	done
 }
 
+# Smaller io_uring rings for the stress tests. Their client sessions each create and destroy an event
+# loop; Linux charges every ring to `ulimit -l` (often 8 MiB, ~38 rings of nbio's default 2048
+# entries) and only gives it back a while after it's destroyed, so default-sized rings run out.
+STRESS_RING="-define:ODIN_NBIO_QUEUE_SIZE=256"
+
 STRESS_NAMES=${STRESS_NAMES:-tests_server.stress_http,tests_server.stress_websocket,tests_server.stress_shutdown_under_load,tests_server.stress_tls,tests_server.stress_tls_shutdown_under_load}
 
 echo "odin $(odin version | awk '{print $NF}') on $(uname -sm)"
@@ -107,9 +112,9 @@ fi
 if [ "$STRESS" != 0 ]; then
 	# One stress test at a time.
 	for name in ${STRESS_NAMES//,/ }; do
-		step "${name#tests_server.} (${STRESS}s)" odin test tests/server -define:STRESS_SECONDS="$STRESS" ${STRESS_EXTRA:-} -define:ODIN_TEST_THREADS=1 -define:ODIN_TEST_NAMES="$name" $DEFS -out:"$OUT/stress"
+		step "${name#tests_server.} (${STRESS}s)" odin test tests/server -define:STRESS_SECONDS="$STRESS" $STRESS_RING ${STRESS_EXTRA:-} -define:ODIN_TEST_THREADS=1 -define:ODIN_TEST_NAMES="$name" $DEFS -out:"$OUT/stress"
 		if [ $ASAN = 1 ]; then
-			step "${name#tests_server.} (asan)" odin test tests/server -sanitize:address -debug -define:STRESS_SECONDS="$STRESS" ${STRESS_EXTRA:-} -define:ODIN_TEST_THREADS=1 -define:ODIN_TEST_NAMES="$name" $DEFS -out:"$OUT/stress-asan"
+			step "${name#tests_server.} (asan)" odin test tests/server -sanitize:address -debug -define:STRESS_SECONDS="$STRESS" $STRESS_RING ${STRESS_EXTRA:-} -define:ODIN_TEST_THREADS=1 -define:ODIN_TEST_NAMES="$name" $DEFS -out:"$OUT/stress-asan"
 		fi
 	done
 fi

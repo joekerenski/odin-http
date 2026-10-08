@@ -20,6 +20,7 @@ import http.client
 import json
 import os
 import random
+import shutil
 import ssl
 import subprocess
 import sys
@@ -44,6 +45,12 @@ MiB = 1 << 20
 def pattern(n):
     """What /big?size=n returns: byte i is i % 251."""
     return (bytes(range(251)) * (n // 251 + 1))[:n]
+
+
+def ws_response_headers(w):
+    """The handshake response headers, with the websockets API before and after 14."""
+    response = getattr(w, "response", None)
+    return response.headers if response is not None else w.response_headers
 
 
 def tls_context(ca=CA):
@@ -212,7 +219,7 @@ class Common:
     def test_websocket_echo(self):
         async def run():
             async with self.ws_connect(compression="deflate") as w:
-                ext = w.response_headers.get("Sec-WebSocket-Extensions", "")
+                ext = ws_response_headers(w).get("Sec-WebSocket-Extensions", "")
                 self.assertIn("permessage-deflate", ext)
                 rng = random.Random(2)
                 for n in (0, 1, 125, 126, 65535, 65536, MiB, 5 * MiB):
@@ -238,7 +245,7 @@ class Common:
     def test_websocket_uncompressed(self):
         async def run():
             async with self.ws_connect(compression=None) as w:
-                self.assertNotIn("Sec-WebSocket-Extensions", w.response_headers)
+                self.assertNotIn("Sec-WebSocket-Extensions", ws_response_headers(w))
                 await w.send(b"\x00" * 100000)
                 self.assertEqual(await w.recv(), b"\x00" * 100000)
 
@@ -321,6 +328,8 @@ class DirectTLS(Direct):
 
     def test_testssl(self):
         """testssl.sh: protocols, ciphers, renegotiation and the known TLS vulnerabilities."""
+        if shutil.which("testssl") is None:
+            self.skipTest("testssl isn't installed")
         u = urllib.parse.urlsplit(self.base)
         with tempfile.TemporaryDirectory() as d:
             report = os.path.join(d, "testssl.json")

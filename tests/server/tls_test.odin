@@ -95,7 +95,7 @@ tls_requests :: proc(t: ^testing.T) {
 
 	// Concurrent connections.
 	{
-		nbio.acquire_thread_event_loop()
+		if !testing.expect_value(t, nbio.acquire_thread_event_loop(), nil) { return }
 		defer nbio.release_thread_event_loop()
 		State :: struct { done, ok: int }
 		s: State
@@ -130,7 +130,7 @@ tls_websocket :: proc(t: ^testing.T) {
 	ts := server_start(t, tls_handler(), tls_opts())
 	defer server_stop(ts)
 
-	nbio.acquire_thread_event_loop()
+	if !testing.expect_value(t, nbio.acquire_thread_event_loop(), nil) { return }
 	defer nbio.release_thread_event_loop()
 
 	// The upgrade happens over TLS, then the WebSocket keeps using the same TLS session.
