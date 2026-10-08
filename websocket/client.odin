@@ -48,6 +48,8 @@ Dial_Error :: enum u8 {
 	Resolve_Failed,
 	// wss://: OpenSSL could not be set up, e.g. `tls_ca_file` couldn't be loaded.
 	TLS_Setup_Failed,
+	// Called on a thread without an nbio event loop.
+	No_Event_Loop,
 }
 
 // Largest handshake response head accepted.
@@ -75,6 +77,7 @@ invalid or the host can't be resolved. Name resolution is blocking.
 The connection lives on the calling thread's event loop.
 */
 dial :: proc(url: string, opts: Dial_Opts, callbacks: Callbacks, allocator := context.allocator) -> (c: ^Conn, err: Dial_Error) {
+	if nbio.current_thread_event_loop() == nil { return nil, .No_Event_Loop }
 	target := parse_ws_url(url) or_return
 
 	ep4, ep6, resolve_err := net.resolve(target.host_port)

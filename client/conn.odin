@@ -65,6 +65,7 @@ Conn :: struct {
 
 
 start :: proc(req: ^Request, url: string, opts: Opts, user_data: rawptr, cb: Callback, allocator: mem.Allocator, stream := Stream{}, stream_user: rawptr = nil) -> Error {
+	if nbio.current_thread_event_loop() == nil { return .No_Event_Loop }
 	t := parse_url(url, context.temp_allocator) or_return
 	request := format_request(req, t, !opts.disable_keep_alive, allocator) or_return
 

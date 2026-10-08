@@ -359,6 +359,14 @@ example.com {
 In Docker, io_uring needs a seccomp profile that allows it (e.g. `--security-opt seccomp=unconfined`);
 x86-64 emulation (Rosetta) doesn't implement io_uring.
 
+Each event loop is an io_uring, about 216 KiB with nbio's default 2048 entries, and on recent kernels
+that memory counts against the user's locked-memory limit (`ulimit -l`, often 8 MiB) unless the process
+runs as root. With 8 MiB that's ~38 event loops for the user across processes: a server on a machine
+with more cores than that starts fewer threads (it logs which couldn't get one). Raise the limit
+(`LimitMEMLOCK=` in a systemd unit), set `Server_Opts.thread_count`, or build with
+`-define:ODIN_NBIO_QUEUE_SIZE=256`. A destroyed ring's memory comes back only a while later, so don't
+create and destroy event loops in quick succession either.
+
 ## Performance
 
 Linux arm64 (OrbStack), server on 2 threads, wrk on 2 other cores (`bench/http.sh`):

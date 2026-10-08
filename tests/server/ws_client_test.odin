@@ -11,6 +11,7 @@ import "core:testing"
 import "core:time"
 
 import http "../.."
+import "../../client"
 import ws "../../websocket"
 
 @(private="file")
@@ -101,7 +102,7 @@ ws_client_echo :: proc(t: ^testing.T) {
 	ts := server_start(t, ws_compressing_echo_handler())
 	defer server_stop(ts)
 
-	nbio.acquire_thread_event_loop()
+	if !testing.expect_value(t, nbio.acquire_thread_event_loop(), nil) { return }
 	defer nbio.release_thread_event_loop()
 
 	url := fmt.tprintf("ws://127.0.0.1:%i/echo?x=1", ts.port)
@@ -119,7 +120,7 @@ ws_client_echo :: proc(t: ^testing.T) {
 @(test)
 ws_client_handshake_failures :: proc(t: ^testing.T) {
 	testing.set_fail_timeout(t, 30 * time.Second)
-	nbio.acquire_thread_event_loop()
+	if !testing.expect_value(t, nbio.acquire_thread_event_loop(), nil) { return }
 	defer nbio.release_thread_event_loop()
 
 	// Rejected synchronously.
@@ -183,7 +184,7 @@ ws_compression_bomb :: proc(t: ^testing.T) {
 	ts := server_start(t, h)
 	defer server_stop(ts)
 
-	nbio.acquire_thread_event_loop()
+	if !testing.expect_value(t, nbio.acquire_thread_event_loop(), nil) { return }
 	defer nbio.release_thread_event_loop()
 
 	// 8 MiB of zeros compresses to ~8 KiB: under the frame limit, far over the message limit.
@@ -201,4 +202,19 @@ ws_compression_bomb :: proc(t: ^testing.T) {
 expect_server_ok :: proc(t: ^testing.T, ts: ^Test_Server, loc := #caller_location) {
 	resp := roundtrip(ts, "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n", 2 * time.Second)
 	testing.expectf(t, status_of(resp) != 0, "server unresponsive: %q", resp, loc = loc)
+}
+
+// Dialing (or an async request) from a thread without an event loop is an error, not a crash.
+@(test)
+client_without_event_loop :: proc(t: ^testing.T) {
+	if !testing.expect(t, nbio.current_thread_event_loop() == nil, "test thread already has an event loop") { return }
+
+	c, err := ws.dial("ws://127.0.0.1:1/", {}, {})
+	testing.expect_value(t, err, ws.Dial_Error.No_Event_Loop)
+	testing.expect(t, c == nil)
+
+	req: client.Request
+	client.request_init(&req, .Get, context.temp_allocator)
+	aerr := client.request_async(&req, "http://127.0.0.1:1/", client.Default_Opts, nil, proc(_: client.Response, _: client.Error, _: rawptr) {})
+	testing.expect_value(t, aerr, client.Error.No_Event_Loop)
 }

@@ -97,6 +97,8 @@ Error :: enum u8 {
 	Unsupported_Encoding,
 	// A `Stream` callback returned false.
 	Cancelled,
+	// `request_async`/`request_stream_async` on a thread without an nbio event loop.
+	No_Event_Loop,
 }
 
 Request :: struct {
@@ -169,8 +171,8 @@ Callback :: #type proc(res: Response, err: Error, user_data: rawptr)
 Sends `req` to `url` on the calling thread's nbio event loop. Returns right away; `cb` is called on
 this thread once the response is complete or the request failed.
 
-An error is returned (and `cb` isn't called) when the URL or request is invalid, the host can't be
-resolved (resolution is blocking) or TLS can't be set up. `req` is serialized before this returns,
+An error is returned (and `cb` isn't called) when the thread has no event loop, the URL or request
+is invalid, the host can't be resolved (resolution is blocking) or TLS can't be set up. `req` is serialized before this returns,
 it can be destroyed right away.
 
 `allocator` must be usable from the event loop's thread, it holds the response.

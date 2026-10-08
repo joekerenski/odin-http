@@ -182,7 +182,11 @@ listen :: proc(
 	if acquire_err := nbio.acquire_thread_event_loop(); acquire_err != nil {
 		// The enum holds raw OS error codes, most have no name, so log the number.
 		when ODIN_OS == .Linux {
-			log.errorf("could not acquire event loop (os error %i): io_uring may be unavailable or blocked, e.g. by a container seccomp profile", i32(acquire_err))
+			if acquire_err == .Allocation_Failed {
+				log.errorf("could not acquire event loop (ENOMEM): io_uring rings count against the locked-memory limit (`ulimit -l`)")
+			} else {
+				log.errorf("could not acquire event loop (os error %i): io_uring may be unavailable or blocked, e.g. by a container seccomp profile", i32(acquire_err))
+			}
 		} else {
 			log.errorf("could not acquire event loop (os error %i)", i32(acquire_err))
 		}
@@ -251,7 +255,15 @@ _server_thread_init :: proc(s: ^Server, ttd: ^Server_Thread) {
 	if td != &s.threads[0] {
 		if err := nbio.acquire_thread_event_loop(); err != nil {
 			// Can't serve on this thread, the others carry on.
-			log.errorf("server thread could not acquire an event loop: %v", err)
+			when ODIN_OS == .Linux {
+				if err == .Allocation_Failed {
+					log.errorf("server thread could not acquire an event loop (ENOMEM): io_uring rings count against the locked-memory limit (`ulimit -l`)")
+				} else {
+					log.errorf("server thread could not acquire an event loop: %v", err)
+				}
+			} else {
+				log.errorf("server thread could not acquire an event loop: %v", err)
+			}
 			delete(td.conns)
 			sync.wait_group_done(&s.threads_closed)
 			return
