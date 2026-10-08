@@ -31,6 +31,31 @@ Test_Server :: struct {
 TRACE_ASSERTIONS :: #config(TRACE_ASSERTIONS, false)
 trace_assertion_proc :: trace.assertion_failure_proc
 
+// Blocking socket calls that retry when interrupted. On Linux a test thread that ran an nbio event
+// loop (io_uring) can still get task work from the kernel after releasing it, and a socket call with a
+// timeout set returns EINTR for that instead of restarting. The test runner reuses threads, so this
+// lands in whatever test runs next.
+tcp_recv :: proc(sock: net.TCP_Socket, buf: []byte) -> (n: int, err: net.TCP_Recv_Error) {
+	for {
+		n, err = net.recv_tcp(sock, buf)
+		if err != .Interrupted { return }
+	}
+}
+
+tcp_send :: proc(sock: net.TCP_Socket, buf: []byte) -> (n: int, err: net.TCP_Send_Error) {
+	for {
+		n, err = net.send_tcp(sock, buf)
+		if err != .Interrupted { return }
+	}
+}
+
+tcp_accept :: proc(sock: net.TCP_Socket) -> (conn: net.TCP_Socket, source: net.Endpoint, err: net.Accept_Error) {
+	for {
+		conn, source, err = net.accept_tcp(sock)
+		if err != .Interrupted { return }
+	}
+}
+
 // Starts a server (single-threaded by default) on 127.0.0.1 with an OS-assigned port.
 server_start :: proc(t: ^testing.T, handler: http.Handler, opts := http.Default_Server_Opts, threads := 1) -> ^Test_Server {
 	ts := new(Test_Server)
@@ -79,7 +104,7 @@ roundtrip :: proc(ts: ^Test_Server, req: string, wait := 500 * time.Millisecond,
 
 	sent := 0
 	for sent < len(req) {
-		n, serr := net.send_tcp(sock, transmute([]byte)req[sent:])
+		n, serr := tcp_send(sock, transmute([]byte)req[sent:])
 		if serr != nil { break }
 		sent += n
 	}
@@ -88,7 +113,7 @@ roundtrip :: proc(ts: ^Test_Server, req: string, wait := 500 * time.Millisecond,
 	bytes.buffer_init_allocator(&out, 0, 512, allocator)
 	buf: [4096]byte
 	for {
-		n, rerr := net.recv_tcp(sock, buf[:])
+		n, rerr := tcp_recv(sock, buf[:])
 		if rerr != nil || n == 0 { break }
 		bytes.buffer_write(&out, buf[:n])
 	}
@@ -204,7 +229,7 @@ raw_dial :: proc(ts: ^Test_Server) -> (r: Raw, ok: bool) {
 raw_send :: proc(r: Raw, data: string) -> bool {
 	sent := 0
 	for sent < len(data) {
-		n, err := net.send_tcp(r.sock, transmute([]byte)data[sent:])
+		n, err := tcp_send(r.sock, transmute([]byte)data[sent:])
 		if err != nil { return false }
 		sent += n
 	}
@@ -218,7 +243,7 @@ raw_recv :: proc(r: Raw, wait: time.Duration, allocator := context.temp_allocato
 	bytes.buffer_init_allocator(&out, 0, 512, allocator)
 	buf: [16384]byte
 	for {
-		n, err := net.recv_tcp(r.sock, buf[:])
+		n, err := tcp_recv(r.sock, buf[:])
 		if err != nil {
 			// Timeout: still open. A reset counts as closed.
 			closed = err != .Timeout && err != .Would_Block

@@ -41,7 +41,7 @@ drip_start :: proc(pieces: []Piece) -> ^Drip {
 	d.port = ep.port
 	net.set_option(d.sock, .Receive_Timeout, 5 * time.Second)
 	d.thread = thread.create_and_start_with_poly_data(d, proc(d: ^Drip) {
-		conn, _, err := net.accept_tcp(d.sock)
+		conn, _, err := tcp_accept(d.sock)
 		if err != nil { return }
 		defer net.close(conn)
 		net.set_option(conn, .Receive_Timeout, 2 * time.Second)
@@ -49,13 +49,13 @@ drip_start :: proc(pieces: []Piece) -> ^Drip {
 		defer delete(head)
 		buf: [4096]byte
 		for !strings.contains(string(head[:]), "\r\n\r\n") {
-			n, rerr := net.recv_tcp(conn, buf[:])
+			n, rerr := tcp_recv(conn, buf[:])
 			if rerr != nil || n == 0 { return }
 			append(&head, ..buf[:n])
 		}
 		for p in d.pieces {
 			if p.wait > 0 { time.sleep(p.wait) }
-			if _, serr := net.send_tcp(conn, transmute([]byte)p.data); serr != nil { return }
+			if _, serr := tcp_send(conn, transmute([]byte)p.data); serr != nil { return }
 		}
 	}, context)
 	return d

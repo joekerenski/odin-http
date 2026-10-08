@@ -230,19 +230,19 @@ canned_start :: proc(responses: []string, hold: time.Duration = 0) -> ^Canned {
 
 	c.thread = thread.create_and_start_with_poly_data(c, proc(c: ^Canned) {
 		for resp in c.responses {
-			conn, _, err := net.accept_tcp(c.sock)
+			conn, _, err := tcp_accept(c.sock)
 			if err != nil { return }
 			net.set_option(conn, .Receive_Timeout, 2 * time.Second)
 			// Read the request head.
 			head: [dynamic]byte
 			buf: [4096]byte
 			for !strings.contains(string(head[:]), "\r\n\r\n") {
-				n, rerr := net.recv_tcp(conn, buf[:])
+				n, rerr := tcp_recv(conn, buf[:])
 				if rerr != nil || n == 0 { break }
 				append(&head, ..buf[:n])
 			}
 			delete(head)
-			if resp != "" { net.send_tcp(conn, transmute([]byte)resp) }
+			if resp != "" { tcp_send(conn, transmute([]byte)resp) }
 			if c.hold > 0 { time.sleep(c.hold) }
 			net.close(conn)
 			sync.atomic_add(&c.served, 1)
@@ -444,7 +444,7 @@ flaky_start :: proc(conns: int) -> ^Flaky {
 			defer delete(head)
 			buf: [4096]byte
 			for !strings.contains(string(head[:]), "\r\n\r\n") {
-				n, err := net.recv_tcp(conn, buf[:])
+				n, err := tcp_recv(conn, buf[:])
 				if err != nil || n == 0 { return false }
 				append(&head, ..buf[:n])
 			}
@@ -452,10 +452,10 @@ flaky_start :: proc(conns: int) -> ^Flaky {
 		}
 		OK :: "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok"
 		for i in 0 ..< f.connections {
-			conn, _, err := net.accept_tcp(f.sock)
+			conn, _, err := tcp_accept(f.sock)
 			if err != nil { return }
 			net.set_option(conn, .Receive_Timeout, 3 * time.Second)
-			if read_head(conn) { net.send_tcp(conn, transmute([]byte)string(OK)) }
+			if read_head(conn) { tcp_send(conn, transmute([]byte)string(OK)) }
 			// The first connection: close when the next request arrives, without answering.
 			if i == 0 { read_head(conn) }
 			net.close(conn)

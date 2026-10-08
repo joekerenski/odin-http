@@ -214,7 +214,7 @@ client_dial :: proc(port: int) -> (c: Client, ok: bool) {
 @(private="file")
 client_fill :: proc(c: ^Client) -> bool {
 	tmp: [16384]byte
-	n, err := net.recv_tcp(c.sock, tmp[:])
+	n, err := tcp_recv(c.sock, tmp[:])
 	if err != nil || n == 0 { return false }
 	append(&c.buf, ..tmp[:n])
 	return true
@@ -224,7 +224,7 @@ client_fill :: proc(c: ^Client) -> bool {
 send_all :: proc(sock: net.TCP_Socket, data: string) -> bool {
 	sent := 0
 	for sent < len(data) {
-		n, err := net.send_tcp(sock, transmute([]byte)data[sent:])
+		n, err := tcp_send(sock, transmute([]byte)data[sent:])
 		if err != nil { return false }
 		sent += n
 	}

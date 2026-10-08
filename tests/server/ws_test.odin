@@ -50,7 +50,7 @@ ws_dial_port :: proc(port: int, extra_headers := "", first_frames: []byte = nil)
 ws_fill :: proc(c: ^Ws_Client, wait: time.Duration) -> bool {
 	net.set_option(c.sock, .Receive_Timeout, wait)
 	tmp: [65536]byte
-	n, err := net.recv_tcp(c.sock, tmp[:])
+	n, err := tcp_recv(c.sock, tmp[:])
 	if err != nil || n == 0 { return false }
 	append(&c.buf, ..tmp[:n])
 	return true

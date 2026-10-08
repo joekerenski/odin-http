@@ -51,14 +51,14 @@ exchange :: proc(port: int, req: string) -> (resp: string, ok: bool) {
 	if err != nil { return }
 	defer net.close(sock)
 	net.set_option(sock, .Receive_Timeout, 3 * time.Second)
-	net.send_tcp(sock, transmute([]byte)req)
+	tcp_send(sock, transmute([]byte)req)
 	net.shutdown(sock, .Send)
 
 	out: bytes.Buffer
 	bytes.buffer_init_allocator(&out, 0, 256, context.temp_allocator)
 	buf: [4096]byte
 	for {
-		n, rerr := net.recv_tcp(sock, buf[:])
+		n, rerr := tcp_recv(sock, buf[:])
 		if rerr == .Timeout { return bytes.buffer_to_string(&out), false }
 		if rerr != nil || n == 0 { break }
 		bytes.buffer_write(&out, buf[:n])
