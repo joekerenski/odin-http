@@ -130,7 +130,10 @@ The buffer can be used to avoid very small writes, like the ones when you use th
 (each write in the json package is only a few bytes). You are allowed to pass nil which will disable
 buffering.
 
-NOTE: You need to call io.destroy to signal the end of the body, OR io.close to send the response.
+Set `r.status` before calling this (or use `response_status` afterwards): a response starts out as
+404 Not Found, and this writes the status line.
+
+NOTE: You need to call io.close (or io.destroy, which closes) to end the body and send the response.
 */
 response_writer_init :: proc(rw: ^Response_Writer, r: ^Response, buffer: []byte) -> io.Writer {
 	headers_set_unsafe(&r.headers, "transfer-encoding", "chunked")
@@ -170,7 +173,8 @@ response_writer_init :: proc(rw: ^Response_Writer, r: ^Response, buffer: []byte)
 				return 0, nil
 
 			case .Destroy:
-				assert(!rw.ended)
+				// `io.destroy` closes the stream first, which already ended the body and sent it.
+				if rw.ended { return 0, nil }
 
 				// Write what is left.
 				write_chunk(b, rw.buf[:])

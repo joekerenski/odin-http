@@ -145,7 +145,8 @@ main :: proc() {
 the core count). Handlers run on those threads and must not block: anything slow (reading the body, calling
 another service with `client.request_async`, timers) continues in a callback, and the handler (or a
 callback) calls `respond` exactly once. `context.temp_allocator` belongs to the request and is freed after
-the response. Responses can also be streamed with `response_writer_init` (chunked).
+the response. Responses can also be streamed with `response_writer_init` (chunked): set
+`res.status` first (a response starts out as 404), and end it with `io.close`.
 
 **Limits and timeouts** (`Server_Opts`, defaults in `Default_Server_Opts`): request line and header section
 8000 bytes, 100 header fields, bodies 8 MiB, `max_connections`, 30s to send the request head, 30s per body

@@ -59,6 +59,14 @@ client_handler :: proc() -> http.Handler {
 			w := http.response_writer_init(&rw, res, nil)
 			for i in 0 ..< 1000 { fmt.wprintf(w, "line %i\n", i) }
 			io.close(w)
+		case "/stream-destroy":
+			// Ended with io.destroy, which closes the stream before destroying it.
+			res.status = .OK
+			buf: [64]byte
+			rw: http.Response_Writer
+			w := http.response_writer_init(&rw, res, buf[:])
+			for i in 0 ..< 100 { fmt.wprintf(w, "line %i\n", i) }
+			io.destroy(w)
 		case "/empty":
 			http.respond(res, http.Status.No_Content)
 		case "/proxy":
@@ -125,6 +133,13 @@ client_against_server :: proc(t: ^testing.T) {
 		for i in 0 ..< 1000 { fmt.sbprintf(&want, "line %i\n", i) }
 		testing.expectf(t, err == nil && res.body == strings.to_string(want), "%v %i", err, len(res.body))
 		testing.expect_value(t, http.headers_get_unsafe(res.headers, "transfer-encoding"), "chunked")
+		client.response_destroy(&res)
+	}
+	{
+		res, err := client.get(fmt.tprintf("%s/stream-destroy", base))
+		want := strings.builder_make(context.temp_allocator)
+		for i in 0 ..< 100 { fmt.sbprintf(&want, "line %i\n", i) }
+		testing.expectf(t, err == nil && res.status == .OK && res.body == strings.to_string(want), "%v %v %i", err, res.status, len(res.body))
 		client.response_destroy(&res)
 	}
 	{
