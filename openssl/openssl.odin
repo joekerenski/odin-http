@@ -80,6 +80,7 @@ foreign lib {
 	SSL_connect :: proc(ssl: ^SSL) -> c.int ---
 	SSL_get_error :: proc(ssl: ^SSL, ret: c.int) -> c.int ---
 	SSL_read :: proc(ssl: ^SSL, buf: [^]byte, num: c.int) -> c.int ---
+	SSL_peek :: proc(ssl: ^SSL, buf: [^]byte, num: c.int) -> c.int ---
 	SSL_write :: proc(ssl: ^SSL, buf: [^]byte, num: c.int) -> c.int ---
 	SSL_free :: proc(ssl: ^SSL) ---
 	SSL_CTX_free :: proc(ctx: ^SSL_CTX) ---

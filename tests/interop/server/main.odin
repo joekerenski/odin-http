@@ -7,6 +7,8 @@
 // server's own TLS (HSTS on), for testing it without Caddy.
 package interop_server
 
+import "core:crypto/sha2"
+import "core:encoding/hex"
 import "core:fmt"
 import "core:io"
 import "core:log"
@@ -14,6 +16,7 @@ import "core:mem"
 import "core:net"
 import "core:os"
 import "core:strconv"
+import "core:strings"
 import "core:thread"
 import "core:time"
 
@@ -21,6 +24,12 @@ import http "../../.."
 import ws "../../../websocket"
 
 file_path: string
+
+sha_hex :: proc(sha: ^sha2.Context_256) -> string {
+	sum: [sha2.DIGEST_SIZE_256]byte
+	sha2.final(sha, sum[:])
+	return string(hex.encode(sum[:], context.temp_allocator))
+}
 
 main :: proc() {
 	context.logger = log.create_console_logger(.Debug if os.get_env("DEBUG", context.temp_allocator) != "" else .Warning)
@@ -50,6 +59,63 @@ main :: proc() {
 			http.headers_set_content_type(&res.headers, "application/octet-stream")
 			http.body_set(res, body)
 			http.respond(res, http.Status.OK)
+		})
+	}))
+
+	// The body streamed (body_stream): "<bytes> <sha256 hex>".
+	http.route_post(&router, "/upload", http.handler(proc(req: ^http.Request, res: ^http.Response) {
+		Up :: struct { req: ^http.Request, res: ^http.Response, n: int, sha: sha2.Context_256 }
+		up := new(Up, context.temp_allocator)
+		up^ = {req = req, res = res}
+		sha2.init_256(&up.sha)
+		http.body_stream(req, -1, up, proc(up: rawptr, data: []byte, done: bool, err: http.Body_Error) {
+			up := (^Up)(up)
+			if err != nil {
+				http.respond(up.res, http.body_error_status(err))
+				return
+			}
+			up.n += len(data)
+			sha2.update(&up.sha, data)
+			if !done {
+				http.body_stream_next(up.req)
+				return
+			}
+			http.respond_plain(up.res, fmt.tprintf("%i %s", up.n, sha_hex(&up.sha)))
+		})
+	}))
+
+	// Rejects the upload after its first piece, 413.
+	http.route_post(&router, "/upload-reject", http.handler(proc(req: ^http.Request, res: ^http.Response) {
+		http.body_stream(req, -1, res, proc(res: rawptr, _: []byte, _: bool, err: http.Body_Error) {
+			http.respond((^http.Response)(res), http.Status.Payload_Too_Large)
+		})
+	}))
+
+	// A multipart/form-data form, streamed: a line per part, "<name>|<filename>|<content type>|<bytes>|<sha256 hex>".
+	http.route_post(&router, "/form", http.handler(proc(req: ^http.Request, res: ^http.Response) {
+		Form :: struct { req: ^http.Request, res: ^http.Response, out: strings.Builder, n: int, sha: sha2.Context_256 }
+		f := new(Form, context.temp_allocator)
+		f^ = {req = req, res = res, out = strings.builder_make(context.temp_allocator)}
+		http.multipart_stream(req, -1, f, proc(f: rawptr, event: http.Multipart_Event, part: ^http.Multipart_Part, data: []byte, err: http.Multipart_Error) {
+			f := (^Form)(f)
+			switch event {
+			case .Part:
+				f.n = 0
+				sha2.init_256(&f.sha)
+			case .Data:
+				f.n += len(data)
+				sha2.update(&f.sha, data)
+			case .Part_End:
+				fmt.sbprintf(&f.out, "%s|%s|%s|%i|%s\n", part.name, part.filename, part.content_type, f.n, sha_hex(&f.sha))
+			case .Done:
+				if err != nil {
+					http.respond(f.res, http.multipart_error_status(err))
+				} else {
+					http.respond_plain(f.res, strings.to_string(f.out))
+				}
+				return
+			}
+			http.multipart_next(f.req)
 		})
 	}))
 

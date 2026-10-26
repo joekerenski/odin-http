@@ -8,6 +8,7 @@ import "core:fmt"
 import "core:io"
 import "core:nbio"
 import "core:net"
+import "core:os"
 import "core:strconv"
 import "core:strings"
 import "core:sync"
@@ -441,8 +442,19 @@ flaky_start :: proc(conns: int) -> ^Flaky {
 			if err != nil { return }
 			net.set_option(conn, .Receive_Timeout, 3 * time.Second)
 			if read_head(conn) { net.send_tcp(conn, transmute([]byte)string(OK)) }
-			// The first connection: close when the next request arrives, without answering.
-			if i == 0 { read_head(conn) }
+			if i == 0 {
+				// The first connection: close when the next request arrives, without answering.
+				read_head(conn)
+			} else {
+				// Later ones: read the rest (a body) before closing, so the close doesn't reset
+				// the connection, which can lose the response.
+				net.set_option(conn, .Receive_Timeout, 200 * time.Millisecond)
+				buf: [4096]byte
+				for {
+					n, err := net.recv_tcp(conn, buf[:])
+					if err != nil || n == 0 { break }
+				}
+			}
 			net.close(conn)
 		}
 	}, context)
@@ -489,6 +501,54 @@ client_keep_alive_retry :: proc(t: ^testing.T) {
 		res, err = client.request(&r, url)
 		testing.expectf(t, err == .Connection_Closed || err == .Network_Error, "POST on a dropped connection: %v", err)
 		client.response_destroy(&res)
+		flaky_stop(f)
+	}
+
+	// A PUT with its body from a file is repeated too, the body from the start.
+	{
+		dir, derr := os.make_directory_temp("", "odin-http-retry-*", context.temp_allocator)
+		if !testing.expect(t, derr == nil) { return }
+		defer os.remove_all(dir)
+		path := strings.concatenate({dir, "/body"}, context.temp_allocator)
+		testing.expect(t, os.write_entire_file(path, strings.repeat("x", 50_000, context.temp_allocator)) == nil)
+
+		f := flaky_start(2)
+		url := fmt.tprintf("http://127.0.0.1:%i/", f.port)
+		res, err := client.get(url)
+		testing.expect(t, err == nil)
+		client.response_destroy(&res)
+
+		r: client.Request
+		client.request_init(&r, .Put, context.temp_allocator)
+		defer client.request_destroy(&r)
+		testing.expect(t, client.body_from_file(&r, path) == nil)
+		res, err = client.request(&r, url)
+		testing.expectf(t, err == nil && res.body == "ok", "PUT from a file on a dropped connection: %v %q", err, res.body)
+		client.response_destroy(&res)
+		flaky_stop(f)
+	}
+
+	// A body that can't be sent again never goes out on a reused connection.
+	{
+		f := flaky_start(2)
+		url := fmt.tprintf("http://127.0.0.1:%i/", f.port)
+		res, err := client.get(url)
+		testing.expect(t, err == nil)
+		client.response_destroy(&res)
+
+		r: client.Request
+		client.request_init(&r, .Put, context.temp_allocator)
+		defer client.request_destroy(&r)
+		once: bool
+		r.source = {user_data = &once, length = 4, read = proc(buf: []byte, once: rawptr) -> (int, bool, bool) {
+			copy(buf, "data")
+			return 4, true, true
+		}}
+		// On the pooled connection it would fail: the server drops it, and the body can't be sent again.
+		res, err = client.request(&r, url)
+		testing.expectf(t, err == nil && res.body == "ok", "PUT from a source without rewind: %v %q", err, res.body)
+		client.response_destroy(&res)
+		client.close_idle_connections()
 		flaky_stop(f)
 	}
 }

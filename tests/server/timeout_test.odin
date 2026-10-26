@@ -93,7 +93,10 @@ body_read_timeout :: proc(t: ^testing.T) {
 
 @(test)
 slow_but_steady_body_is_fine :: proc(t: ^testing.T) {
-	ts := server_start(t, echo_handler(), fast_opts())
+	// Without the minimum rate (10 bytes/s is well under it), see upload_min_rate.
+	opts := fast_opts()
+	opts.body_min_rate = -1
+	ts := server_start(t, echo_handler(), opts)
 	defer server_stop(ts)
 
 	c, _ := raw_dial(ts)

@@ -9,8 +9,8 @@ An HTTP/1.1 server, an HTTP(S) client and WebSockets for [Odin](https://odin-lan
 
 | Import | Package | What it is |
 |---|---|---|
-| `odin-http` | `http` | The server: routing, middleware, request bodies, cookies, static files, streaming responses, rate limiting |
-| `odin-http/client` | `client` | HTTP/1.1 client for `http://` and `https://`, blocking or async, with connection reuse |
+| `odin-http` | `http` | The server: routing, middleware, request bodies (also streamed, and multipart forms), cookies, static files, streaming responses, rate limiting |
+| `odin-http/client` | `client` | HTTP/1.1 client for `http://` and `https://`, blocking or async, with connection reuse, streamed downloads and uploads |
 | `odin-http/websocket` | `websocket` | WebSockets (RFC 6455 + permessage-deflate): server upgrade and `ws://`/`wss://` client |
 | `odin-http/openssl` | `openssl` | OpenSSL 3 bindings used by the client and WebSocket TLS (you don't need to import it) |
 
@@ -28,6 +28,8 @@ themselves and always verify certificates.
   (517/517 cases each, compression included).
 - **Server TLS**: TLS 1.2/1.3 through the system's OpenSSL, certificates reloaded when they're renewed;
   `testssl.sh` reports nothing (no old protocols, no CBC, no renegotiation, no known vulnerabilities).
+- **Uploads**: request bodies of any size stream through a 64 KiB buffer on both sides, multipart forms
+  included, and an upload rejected midway gets its 413 to the client (checked with curl, also through Caddy).
 - **Client**: verified TLS, strict response parsing with size limits, deadlines, keep-alive.
 - **Performance**: plaintext ~600k req/s with keep-alive on 2 threads (Linux arm64), WebSocket echo
   ~1.9M small messages/s on one thread. See [Performance](#performance).
@@ -148,8 +150,54 @@ callback) calls `respond` exactly once. `context.temp_allocator` belongs to the 
 the response. Responses can also be streamed with `response_writer_init` (chunked).
 
 **Limits and timeouts** (`Server_Opts`, defaults in `Default_Server_Opts`): request line and header section
-8000 bytes, 100 header fields, bodies 8 MiB, `max_connections`, 30s to send the request head, 30s per body
-read, 30s per write, 3 minutes idle between keep-alive requests, 30s for in-flight requests at shutdown.
+8000 bytes, 100 header fields, bodies 8 MiB (in memory, see below), `max_connections`, 30s to send the
+request head, 30s per body read and at least 500 bytes/s on average (`body_min_rate`), 30s per write,
+3 minutes idle between keep-alive requests, 30s for in-flight requests at shutdown.
+
+### Request bodies
+
+- `body` reads the whole body into memory (up to `max_body_size`), for JSON, forms and the like.
+- `body_stream` hands it over in pieces as it arrives, for uploads of any size. The server reads the next
+  piece only when the handler asks for it with `body_stream_next`, so a slow disk or upstream slows the
+  client down instead of filling memory. Each connection uses its 64 KiB read buffer, however large the
+  body is.
+- `multipart_stream` does the same for `multipart/form-data` (HTML forms with file inputs): each part's
+  headers (`name`, `filename`, `content_type`), its content in pieces, then the next part.
+  `multipart_parse` splits a form that's in memory already.
+- A handler can respond before the body ended, e.g. to reject an upload (413). The server discards what
+  follows if it's small (256 KiB) to keep the connection, and otherwise closes it. When closing, it reads
+  for up to 2 more seconds before the socket goes away, so the client gets the 413 instead of a
+  connection reset.
+
+```odin
+// An upload written to a file as it arrives. `nbio` writes asynchronously on Linux (io_uring);
+// on macOS it's a plain write.
+Upload :: struct { req: ^http.Request, res: ^http.Response, fd: nbio.Handle, offset: int }
+
+upload :: proc(req: ^http.Request, res: ^http.Response) {
+	fd, err := nbio.open_sync("/tmp/upload.bin", mode = {.Write, .Create, .Trunc})
+	if err != nil { http.respond(res, http.Status.Internal_Server_Error); return }
+	up := new(Upload, context.temp_allocator) // lives until the response is sent
+	up^ = {req = req, res = res, fd = fd}
+	http.body_stream(req, 10 * mem.Gigabyte, up, proc(up: rawptr, data: []byte, done: bool, err: http.Body_Error) {
+		up := (^Upload)(up)
+		if err != nil {
+			nbio.close(up.fd)
+			http.respond(up.res, http.body_error_status(err))
+			return
+		}
+		nbio.write_poly2(up.fd, up.offset, data, up, done, proc(op: ^nbio.Operation, up: ^Upload, done: bool) {
+			up.offset += op.write.written
+			if op.write.err != nil || done {
+				nbio.close(up.fd)
+				http.respond(up.res, http.Status.Created if op.write.err == nil else http.Status.Internal_Server_Error)
+				return
+			}
+			http.body_stream_next(up.req) // the next piece
+		})
+	})
+}
+```
 
 More: [examples/](examples/) (`minimal`, `routing`, `complete` with cookies and static files, `client`,
 `websocket` chat).
@@ -210,8 +258,15 @@ proxy :: proc(req: ^http.Request, res: ^http.Response) {
   60s when streaming) bounds each wait for more of the response.
 - Connections are kept alive and reused per origin (`idle_timeout` 30s, `max_idle_per_host` 4,
   `disable_keep_alive`). Each thread has its own pool (a socket stays on the event loop that opened
-  it); the blocking calls all run on the client's own thread, so they share one. A dead pooled connection is replaced transparently;
-  idempotent requests (GET, HEAD, PUT, DELETE) are retried once if the server closed it as the request went out.
+  it); the blocking calls all run on the client's own thread, so they share one. A dead pooled
+  connection is replaced transparently; idempotent requests (GET, HEAD, PUT, DELETE) are retried once
+  if the server closed it as the request went out (an upload only if its source can rewind; one that
+  can't always gets a new connection). A POST isn't retried, so keep `idle_timeout` well below the
+  server's idle timeout, then the client drops a connection before the server closes it.
+- Uploads: `body_from_file(&req, path)`, or any `Body_Source` (a read callback, with a length or -1 for
+  chunked, optionally rewindable). It sends 64 KiB at a time as the server takes it. While sending, each
+  write has `stall_timeout` (60s) instead of `timeout`. If the server answers before the body is
+  complete (a 413), the client stops and returns that answer.
 - Requests are validated, not escaped: a header value with a line break or an invalid cookie is refused
   with `.Invalid_Request`.
 - Names are resolved with a blocking DNS lookup.

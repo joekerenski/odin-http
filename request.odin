@@ -28,6 +28,10 @@ Request :: struct {
 	// Internal usage only.
 	_scanner:         ^Scanner,
 	_body_ok:         Maybe(bool),
+	// Set by `body_stream`.
+	_stream:          ^Body_Stream,
+	// Set by `multipart_stream`.
+	_multipart:       ^Multipart_Stream,
 	_framing:         Body_Framing,
 	_content_length:  int,
 	// The client sent `Expect: 100-continue` and we have not answered it yet.

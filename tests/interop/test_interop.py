@@ -140,6 +140,47 @@ class Common:
                             "--data-binary", f"@{f.name}", self.base + "/echo")
         self.assertEqual(hashlib.sha256(out).digest(), hashlib.sha256(data).digest())
 
+    # --- Uploads, streamed by the server (body_stream, multipart_stream) ---
+
+    def test_streamed_upload(self):
+        """curl uploads a file as it reads it, with a length and chunked (from stdin)."""
+        data = os.urandom(64 * MiB)
+        want = f"{len(data)} {hashlib.sha256(data).hexdigest()}"
+        with tempfile.NamedTemporaryFile() as f:
+            f.write(data)
+            f.flush()
+            out = self.curl("-X", "POST", "-T", f.name, self.base + "/upload")
+            self.assertEqual(out.decode(), want)
+            with open(f.name, "rb") as stdin:
+                p = subprocess.run(["curl", "-fsS", "--max-time", "30", "--cacert", self.ca, "-X", "POST", "-T", "-",
+                                    self.base + "/upload"], stdin=stdin, capture_output=True, timeout=60)
+            self.assertEqual((p.returncode, p.stdout.decode()), (0, want), p.stderr.decode())
+
+    def test_upload_rejected_early(self):
+        """A 413 after the first piece of a 200 MiB upload reaches curl (with and without Expect:
+        100-continue): the server keeps reading for a moment before closing, so the close doesn't
+        reset the connection under the response."""
+        with tempfile.NamedTemporaryFile() as f:
+            f.truncate(200 * MiB)
+            for expect in ("Expect: 100-continue", "Expect:"):
+                p = subprocess.run(["curl", "-sS", "--max-time", "30", "--cacert", self.ca, "-o", "/dev/null",
+                                    "-w", "%{http_code}", "-H", expect, "-X", "POST", "-T", f.name, self.base + "/upload-reject"],
+                                   capture_output=True, timeout=60)
+                self.assertEqual(p.stdout.decode(), "413", f"{expect}: {p.stderr.decode()}")
+
+    def test_multipart_form(self):
+        """curl -F, as a browser sends a form with a file."""
+        data = os.urandom(5 * MiB)
+        sha = lambda b: hashlib.sha256(b).hexdigest()
+        with tempfile.NamedTemporaryFile(suffix=".bin") as f:
+            f.write(data)
+            f.flush()
+            out = self.curl("-F", "title=hello", "-F", f"file=@{f.name};type=application/octet-stream;filename=up load.bin",
+                            "-F", "empty=", self.base + "/form")
+        self.assertEqual(out.decode(), f"title||text/plain|5|{sha(b'hello')}\n"
+                                       f"file|up load.bin|application/octet-stream|{len(data)}|{sha(data)}\n"
+                                       f"empty||text/plain|0|{sha(b'')}\n")
+
     def test_stream(self):
         r, body = self.request("GET", "/stream?n=20000")
         self.assertEqual(r.status, 200)

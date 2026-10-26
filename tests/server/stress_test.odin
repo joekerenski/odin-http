@@ -12,6 +12,7 @@ package tests_server
 
 import "core:bytes"
 import "core:fmt"
+import "core:hash"
 import "core:io"
 import "core:log"
 import "core:math/rand"
@@ -132,6 +133,9 @@ expect_healthy :: proc(t: ^testing.T, ts: ^Test_Server, loc := #caller_location)
 //   /slow    responds 1-30ms later from a timer (the client may be gone by then)
 //   /stream  chunked response
 //   /ws      WebSocket echo, registered for broadcasts
+//   /sup     streams the body (body_stream), responds "<bytes> <fnv64a>"; /sup-slow asks for each
+//            piece from a timer; /sup-reject responds "rejected" on the first piece (the rest is
+//            discarded, the connection stays)
 //   other    "hello"
 @(private="file")
 stress_handler :: proc(s: ^Stress) -> http.Handler {
@@ -148,6 +152,34 @@ stress_handler :: proc(s: ^Stress) -> http.Handler {
 					}
 					http.respond_plain(res, body)
 				})
+			case "/sup", "/sup-slow", "/sup-reject":
+				Sup :: struct { req: ^http.Request, res: ^http.Response, n: int, sum: u64, done: bool }
+				sup := new(Sup, context.temp_allocator)
+				sup^ = {req = req, res = res, sum = 0xcbf29ce484222325}
+				on_piece :: proc(sup: rawptr, data: []byte, done: bool, err: http.Body_Error) {
+					sup := (^Sup)(sup)
+					if err != nil {
+						http.respond(sup.res, http.body_error_status(err))
+						return
+					}
+					sup.n   += len(data)
+					sup.sum  = hash.fnv64a(data, sup.sum)
+					sup.done = done
+					switch sup.req.url.path {
+					case "/sup-reject":
+						http.respond_plain(sup.res, "rejected")
+					case "/sup-slow":
+						nbio.timeout_poly(time.Duration(rand.int_max(3)) * time.Millisecond, sup, proc(_: ^nbio.Operation, sup: ^Sup) {
+							if sup.done { sup_respond(sup) } else { http.body_stream_next(sup.req) }
+						})
+					case:
+						if done { sup_respond(sup) } else { http.body_stream_next(sup.req) }
+					}
+				}
+				sup_respond :: proc(sup: ^Sup) {
+					http.respond_plain(sup.res, fmt.tprintf("%i %x", sup.n, sup.sum))
+				}
+				http.body_stream(req, 1 << 20, sup, on_piece)
 			case "/big":
 				http.respond_plain(res, string(big_body[:]))
 			case "/slow":
@@ -305,15 +337,26 @@ read_response :: proc(c: ^Client) -> (status: int, body: string, ok: bool) {
 
 @(private="file")
 random_text :: proc(n: int) -> string {
-	b := make([]byte, n, context.temp_allocator)
-	for &c in b { c = 'a' + byte(rand.int_max(26)) }
-	return string(b)
+	// A random part of a pool made once: generating large bodies byte by byte is slow (under ASan,
+	// in the hunt) and would keep a fresh connection silent past the server's timeouts.
+	@(static) pool: [256 * 1024]byte
+	@(static) once: sync.Once
+	sync.once_do(&once, proc() {
+		for &c in pool { c = 'a' + byte(rand.int_max(26)) }
+	})
+	assert(n <= len(pool))
+	start := rand.int_max(len(pool) - n + 1)
+	return string(pool[start:start + n])
 }
 
-// A random valid request and the body its response must have.
+/*
+A random valid request and the body its response must have. `small` keeps uploads small: a client
+that sends all its requests before reading (pipelined) would otherwise block on large ones while the
+server blocks on responses nobody reads yet.
+*/
 @(private="file")
-random_request :: proc() -> (req: string, want: string) {
-	switch rand.int_max(6) {
+random_request :: proc(small := false) -> (req: string, want: string) {
+	switch rand.int_max(8) {
 	case 0:
 		return "GET /plain HTTP/1.1\r\nHost: x\r\n\r\n", "hello"
 	case 1:
@@ -322,6 +365,13 @@ random_request :: proc() -> (req: string, want: string) {
 		return "GET /slow HTTP/1.1\r\nHost: x\r\n\r\n", "slow"
 	case 3:
 		return "GET /stream HTTP/1.1\r\nHost: x\r\n\r\n", "streamed body"
+	case 6, 7:
+		// Streamed upload, up to 200 KB (less than what the server discards for an early response).
+		body := random_text(rand.int_max(8192 if small else 200_000))
+		paths := []string{"/sup", "/sup-slow", "/sup-reject"}
+		path  := paths[rand.int_max(3)]
+		want = "rejected" if path == "/sup-reject" else fmt.tprintf("%i %x", len(body), hash.fnv64a(transmute([]byte)body))
+		return upload_request(path, body, rand.int_max(2) == 0), want
 	case 4:
 		body := random_text(rand.int_max(8192))
 		buf: [20]byte
@@ -345,6 +395,25 @@ random_request :: proc() -> (req: string, want: string) {
 		strings.write_string(&sb, "0\r\n\r\n")
 		return strings.to_string(sb), body
 	}
+}
+
+// A POST of `body`, with Content-Length or chunked in random pieces.
+@(private="file")
+upload_request :: proc(path, body: string, chunked: bool) -> string {
+	sb := strings.builder_make(context.temp_allocator)
+	if !chunked {
+		fmt.sbprintf(&sb, "POST %s HTTP/1.1\r\nHost: x\r\nContent-Length: %i\r\n\r\n%s", path, len(body), body)
+		return strings.to_string(sb)
+	}
+	fmt.sbprintf(&sb, "POST %s HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n", path)
+	rest := body
+	for len(rest) > 0 {
+		n := 1 + rand.int_max(min(len(rest), 70_000))
+		fmt.sbprintf(&sb, "%x\r\n%s\r\n", n, rest[:n])
+		rest = rest[n:]
+	}
+	strings.write_string(&sb, "0\r\n\r\n")
+	return strings.to_string(sb)
 }
 
 @(private="file")
@@ -371,11 +440,19 @@ http_session :: proc(s: ^Stress) {
 
 	switch rand.int_max(100) {
 	case 0 ..< 40: // Keep-alive: several requests, one after another.
-		for _ in 0 ..< 1 + rand.int_max(5) {
-			req, want := random_request()
-			if !send_all(c.sock, req) { fail(s, "keep-alive: send failed"); return }
+		// Made up front: generating large bodies between requests (slow under ASan and the hunt's
+		// load) can take the connection past the server's idle timeout.
+		reqs := make([][2]string, 1 + rand.int_max(5), context.temp_allocator)
+		for &r in reqs { r[0], r[1] = random_request() }
+		last := time.tick_now()
+		for r in reqs {
+			idle := time.tick_since(last)
+			if !send_all(c.sock, r[0]) { fail(s, "keep-alive: send failed"); return }
 			status, body, rok := read_response(&c)
-			if !check_response(s, "keep-alive", status, body, want, rok) { return }
+			// The client was idle long enough for the server to close the connection, rightly.
+			if !rok && len(c.buf) == 0 && idle > stress_opts().idle_timeout - 500 * time.Millisecond { return }
+			if !check_response(s, "keep-alive", status, body, r[1], rok) { return }
+			last = time.tick_now()
 		}
 
 	case 40 ..< 55: // Pipelined: all requests at once, then all responses in order.
@@ -384,7 +461,7 @@ http_session :: proc(s: ^Stress) {
 		sb := strings.builder_make(context.temp_allocator)
 		for &want in wants {
 			req: string
-			req, want = random_request()
+			req, want = random_request(small = true)
 			strings.write_string(&sb, req)
 		}
 		if !send_all(c.sock, strings.to_string(sb)) { fail(s, "pipelined: send failed"); return }
@@ -397,9 +474,15 @@ http_session :: proc(s: ^Stress) {
 		req, _ := random_request()
 		send_all(c.sock, req[:1 + rand.int_max(len(req) - 4)])
 
-	case 63 ..< 71: // Gone in the middle of the body.
-		send_all(c.sock, "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 5000\r\n\r\n")
-		send_all(c.sock, random_text(rand.int_max(4000)))
+	case 63 ..< 71: // Gone in the middle of the body (also of a streamed one, sometimes with a reset).
+		paths := []string{"/echo", "/sup", "/sup-slow", "/sup-reject"}
+		path  := paths[rand.int_max(4)]
+		req := upload_request(path, random_text(1 + rand.int_max(100_000)), rand.int_max(2) == 0)
+		send_all(c.sock, req[:rand.int_max(len(req))])
+		if rand.int_max(2) == 0 {
+			close_rst(c.sock)
+			closed = true
+		}
 
 	case 71 ..< 79: // Reset right after a request (the response may be in flight).
 		send_all(c.sock, "GET /slow HTTP/1.1\r\nHost: x\r\n\r\n" if rand.int_max(2) == 0 else "GET /big HTTP/1.1\r\nHost: x\r\n\r\n")
@@ -672,6 +755,9 @@ stress_shutdown_under_load :: proc(t: ^testing.T) {
 @(private="file")
 stress_tls_opts :: proc() -> http.Server_Opts {
 	opts := stress_opts()
+	// Well above the clients' idle timeout, see tls_client_round. (Idle connections closed under load
+	// are covered by the plain HTTP stress tests, whose clients don't pool.)
+	opts.idle_timeout = 10 * time.Second
 	opts.tls = http.TLS_Opts{cert_file = TLS_DIR + "server_a.pem", key_file = TLS_DIR + "server_a.key"}
 	return opts
 }
@@ -701,6 +787,7 @@ tls_client_round :: proc(s: ^Stress) {
 		want:   string,
 		cancel: bool,
 		done:   bool,
+		what:   string,
 	}
 	batch := make([]Pending, 8, context.temp_allocator)
 	for &p in batch {
@@ -708,9 +795,14 @@ tls_client_round :: proc(s: ^Stress) {
 		opts := client.Default_Opts
 		opts.tls_ca_file = STRESS_CA
 		opts.disable_keep_alive = rand.int_max(3) == 0
+		// Well below the server's idle timeout (10s): otherwise a POST can go out on a pooled
+		// connection the server is closing just then, and a POST isn't sent again (it's not
+		// idempotent). The margin has to cover how late a client gets to a response under the hunt's
+		// load, which was seen to be well over a second.
+		opts.idle_timeout = time.Second
 		r: client.Request
 		path := "/plain"
-		switch rand.int_max(6) {
+		switch rand.int_max(7) {
 		case 0:
 			client.request_init(&r, .Get, context.temp_allocator)
 			path, p.want = "/plain", "hello"
@@ -731,8 +823,31 @@ tls_client_round :: proc(s: ^Stress) {
 		case 5:
 			client.request_init(&r, .Get, context.temp_allocator)
 			path, p.cancel = "/big", true
+		case 6:
+			// The body from a source, with a length or chunked, sometimes rejected by the server.
+			client.request_init(&r, .Post, context.temp_allocator)
+			Src :: struct { body: string, offset: int }
+			src := new(Src, context.temp_allocator)
+			src.body = random_text(rand.int_max(200_000))
+			r.source = {
+				user_data = src,
+				length    = len(src.body) if rand.int_max(2) == 0 else -1,
+				read = proc(buf: []byte, src: rawptr) -> (int, bool, bool) {
+					src := (^Src)(src)
+					n := copy(buf, src.body[src.offset:])
+					src.offset += n
+					return n, src.offset == len(src.body), true
+				},
+				rewind = proc(src: rawptr) -> bool { (^Src)(src).offset = 0; return true },
+			}
+			if rand.int_max(3) == 0 {
+				path, p.want = "/sup-reject", "rejected"
+			} else {
+				path, p.want = "/sup", fmt.tprintf("%i %x", len(src.body), hash.fnv64a(transmute([]byte)src.body))
+			}
 		}
 		url := fmt.tprintf("https://localhost:%i%s", s.port, path)
+		p.what = fmt.tprintf("%v %s keep-alive=%v", r.method, path, !opts.disable_keep_alive)
 		on_done :: proc(res: client.Response, err: client.Error, user_data: rawptr) {
 			p := (^Pending)(user_data)
 			p.done = true
@@ -742,7 +857,7 @@ tls_client_round :: proc(s: ^Stress) {
 			case p.cancel:
 				if err != .Cancelled { fail(p.s, "cancelled stream ended with %v", err) }
 			case err != nil:
-				fail(p.s, "https request: %v", err)
+				fail(p.s, "https request (%s): %v", p.what, err)
 			case res.body != p.want:
 				fail(p.s, "https response: %i bytes, want %i", len(res.body), len(p.want))
 			case:

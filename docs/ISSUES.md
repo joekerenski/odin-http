@@ -141,7 +141,7 @@ The client was rewritten on nbio (`client/`): `request_async` on the calling thr
   - When sending fails (a server answering early, e.g. 413, and closing) the response is still read.
 - [x] **A2** Non-blocking client on nbio, to be used by the WebSocket client and to stop blocking event-loop threads.
 - [x] **C18** Keep-alive and connection pooling (`client/pool.odin`):
-  - One pool for the process, by origin (scheme, host, port, CA file), shared by all threads: a connection is only in the pool while nothing is in flight on it, and nbio keeps no per-socket state between operations (one-shot kqueue filters, io_uring), so any event loop can take it. The blocking `request` (a thread per call) benefits as much as `request_async`.
+  - ~~One pool for the process, by origin (scheme, host, port, CA file), shared by all threads: a connection is only in the pool while nothing is in flight on it, and nbio keeps no per-socket state between operations (one-shot kqueue filters, io_uring), so any event loop can take it. The blocking `request` (a thread per call) benefits as much as `request_async`.~~ Wrong for kqueue, see B1 in Phase 7: one pool per thread, by origin (scheme, host, port, CA file), and the blocking calls share the client thread's.
   - Reused only after a complete HTTP/1.1 response framed by Content-Length or chunked, without `Connection: close`, with nothing (plaintext or TLS records) left over. LIFO; `Opts.idle_timeout` (30s), `Opts.max_idle_per_host` (4), 64 in total; `Opts.disable_keep_alive`; `close_idle_connections()`.
   - Before reuse a `poll` with zero timeout: a readable idle connection (closed by the server, or something unexpected arrived) is dropped. If a reused connection still fails before any of the response arrived (the server closed it as the request went out), an idempotent request (GET, HEAD, PUT, DELETE, OPTIONS, TRACE) is repeated once on a new connection; others (POST, PATCH) report the error, as the server may have acted on them.
   - Found on the way, in the server: shutting down with an idle keep-alive client that stays connected hung forever (the pending read for the next request never completed, and the event loop runs until nothing is pending). Idle connections are now shut down in both directions at shutdown. Test: `shutdown_with_idle_keepalive_client` (hangs without the fix).
@@ -172,6 +172,40 @@ Found while doing it (all with regression tests or hunts):
 - [x] **B3** Server: `server_shutdown` set `closing` and then woke every thread's event loop, but a thread could notice `closing` on its own, finish and release its loop first; the wake-up then wrote to freed memory (segfault, found by the hunt under gdb, about 1 in 10 runs with all stress tests at once). The wake-ups and a thread releasing its loop are now serialized (`Server.wake_mu`).
 - [x] **B4** Client: `format_request` looked headers up with `headers_get`, which allocates a lowercased copy of the key each time: 3 small leaks per request with a heap allocator.
 - [x] **B5** Bench: the no-keep-alive scenario measured keep-alive (see P6).
+
+## Phase 8: Streaming uploads (2026-10-07)
+
+- [x] **U1** Server: `body_stream` / `body_stream_next` (body_stream.odin), the body in pieces as it arrives. Pull-based: nothing more is read until the handler asks for the next piece, so TCP flow control paces the client, and the memory per connection is the 64 KiB read buffer (`STREAM_BUF_SIZE`) at any body size.
+  - Content-Length and chunked (a chunk of any size is split, trailers at the end), `Expect: 100-continue` answered on the first call, `max_length` instead of `max_body_size`.
+  - Pieces are handed out in a loop, not recursively, so thousands of tiny chunks buffered at once don't nest calls.
+  - The handler may respond at any time: the rest is discarded up to `Max_Post_Handler_Discard_Bytes` (256 KiB) to keep the connection, or it's closed. A read in flight when it responds is waited for.
+- [x] **U2** `Server_Opts.body_min_rate` (500 B/s): a body must arrive at an average of at least that, with `body_read_timeout` as grace and at most that much banked ahead; time a handler holds a streamed piece doesn't count. Applies to `body` too. Before, a client could hold a connection forever with one byte every 29 seconds.
+- [x] **U3** Lingering close (RFC 9112 9.6): a closing connection reads and discards what the client still sends, for up to 2s (closing as soon as the client does). Before, closing with unread data made the kernel reset the connection, which can destroy the response before the client reads it: a 413 for an upload still being sent (also the old 413 for a Content-Length over `max_body_size`) reached curl as a reset. With lingering turned off, the interop test gets no response at all.
+- [x] **U4** The scanner reuses the consumed part of its buffer before growing it (the old TODO), so a stream never grows it.
+- [x] **U5** Client: `Request.source` (`Body_Source`: a read callback, the length or -1 for chunked, an optional rewind) and `body_from_file`. The body goes out in parts of 64 KiB, each once the previous one is written.
+  - While the body is sent, each write gets `stall_timeout` (60s unless set) instead of the request's `timeout`, which counts again once the body is out.
+  - Between parts, a zero-timeout poll checks for an early response. Over TLS, records that turn out to be only session tickets are processed and sending carries on. On a response, the client stops sending and returns it.
+  - A source that can be rewound may use pooled connections and is retried (idempotent methods). One that can't always gets a new connection.
+  - A source that fails, or doesn't produce exactly its length, fails the request (`.Body_Source_Failed`), checked before the last part goes out.
+- [x] **U6** multipart/form-data (RFC 7578, multipart.odin): `multipart_stream` on top of `body_stream` (events `.Part`, `.Data` pieces, `.Part_End`, `.Done`, the same pull model), and `multipart_parse` for a body in memory.
+  - Delimiters are found across pieces: the end of a piece that may start one is held back (at most 73 bytes).
+  - Preamble, epilogue and transport padding are skipped. Part headers are parsed with the server's header rules and limited (`Multipart_Opts`: 1000 parts, 8 KiB and 32 fields per part).
+  - Names and filenames are read as browsers send them (quotes percent-encoded, no backslash escapes).
+- Tests:
+  - `upload_test.odin`:
+    - Server side: 32 MiB and 256 MiB uploads through the 64 KiB buffer; chunks of 1 byte to 1 MiB, also with the framing split at every byte; an async next; keep-alive and pipelining after streamed bodies; early responses (from the callback, from a timer, before the first read) that keep or close the connection; limits; bad framing; Expect; a client leaving mid-body; the minimum rate, and paused time not counting.
+    - Client side: uploads from a file, sent twice on one connection; generators with and without a length, in parts of 1 byte and up; sources that fail or miss their length; rejected uploads that stop early; all of it over TLS too.
+  - `client_keep_alive_retry`: a PUT from a file is repeated, and a source that can't rewind never goes out on a reused connection.
+  - `multipart_test.odin`: browser-style forms with tricky content, streamed, paused and in memory; the body in pieces of 1 to 64 bytes; every error status; a 64 MiB file part.
+  - Streamed uploads, also rejected and from client sources, in `stress_http` and `stress_tls`.
+  - `scripts/interop.sh`: curl uploads of 64 MiB (with a length and chunked), a 413 for a 200 MiB upload (with and without `Expect`), and a `curl -F` form; directly, over the server's TLS and through Caddy.
+
+Found while doing it:
+
+- [x] **B6** The stress tests' pipelining client sends all its requests before reading any response. With uploads of up to 200 KB in a batch, the server's responses filled the socket buffers while the client was still blocked sending, until the server's write timeout closed the connection. Real pipelining clients read while they send; the pipelined batches now carry small uploads only.
+- [x] **B7** In the hunt (all stress tests at once on 2 CPUs), POSTs failed with `.Connection_Closed`. A POST went out on a pooled connection just as the server's 2s idle timeout closed it, and a POST isn't retried (not idempotent; Go's client does the same). Each failure matched an idle close a few hundred ms earlier. The stress client kept idle connections for 30s (the default), and under that load a client got to a response more than a second after it was sent. Fixed in the test, and a rule for using the client: keep the client's `idle_timeout` well below the server's (the TLS stress now uses 1s against 10s).
+- [x] **B8** Server: the lingering close (U3) left `Connection.lingering` set after the linger ended. Between the socket's close and the connection leaving the thread's map, the descriptor number can already belong to a new socket, and a shutdown starting then called `shutdown()` on it: it killed an unrelated connection (in the hunt, another server's fresh connection in the same process; in a program, any socket). Found by the hunt (a client's first request failing within microseconds), confirmed with a trace of every accept and close by descriptor. The flag is cleared before the socket is closed.
+- [x] **B9** Stress test: request bodies were generated after dialing, byte by byte; with uploads of 200 KB that kept a fresh connection silent past the server's 2s header timeout under ASan and the hunt's load, and the server rightly closed it. Bodies come from a pre-generated pool now, and a keep-alive session tolerates the server closing the connection after the client was idle that long.
 
 ## Phase 6: Performance
 

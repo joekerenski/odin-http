@@ -334,6 +334,18 @@ response_send :: proc(r: ^Response, conn: ^Connection, loc := #caller_location) 
 	assert(!r.sent, "response has already been sent", loc)
 	r.sent = true
 
+	// A streamed request body that is still coming in is dealt with first.
+	if st := conn.loop.req._stream; st != nil && body_stream_abandon(st, r) {
+		return
+	}
+	response_send_decide(r)
+}
+
+// Sends the response, after reading or discarding what's left of the request body, or closes.
+@(private)
+response_send_decide :: proc(r: ^Response) {
+	conn := r._conn
+
 	check_body :: proc(res: rawptr, body: Body, err: Body_Error) {
 		res := cast(^Response)res
 		will_close: bool
