@@ -11,6 +11,9 @@ certificate and host name are always verified).
 handler, or anywhere else an nbio event loop runs, use `request_async`, which runs on the calling
 thread's event loop.
 
+A request body can be sent as it's produced instead of from memory (a large upload): see
+`Body_Source` and `body_from_file`.
+
 Responses are read completely, within `Opts` limits. To process a body as it arrives (a large
 download, Server-Sent Events from a streaming API), use `request_stream` / `request_stream_async`
 with a `Stream`; `SSE` (sse.odin) parses an event stream. Connections are reused (keep-alive)
@@ -23,6 +26,7 @@ import "core:encoding/json"
 import "core:io"
 import "core:mem"
 import "core:mem/virtual"
+import "core:os"
 import "core:strings"
 import "core:time"
 
@@ -99,6 +103,8 @@ Error :: enum u8 {
 	Cancelled,
 	// `request_async`/`request_stream_async` on a thread without an nbio event loop.
 	No_Event_Loop,
+	// The request's `Body_Source` failed, or produced more or less than its `length`.
+	Body_Source_Failed,
 }
 
 Request :: struct {
@@ -106,6 +112,89 @@ Request :: struct {
 	headers: http.Headers,
 	cookies: [dynamic]http.Cookie,
 	body:    bytes.Buffer,
+	// Sends the body from this, as it's produced, instead of from `body` (which must be empty).
+	source:  Body_Source,
+
+	_file:   ^File_Source,
+}
+
+/*
+A request body produced while it's sent, so it never has to be in memory as a whole (a large file
+upload): the client asks for the next part once the previous one is written to the connection, the
+server's pace (TCP flow control) sets the pace.
+
+The callbacks run on the thread doing the request (the event loop's for `request_async`, the
+client's own thread for `request`), and `user_data` must stay valid until the request ended.
+
+While the body is being sent, each write may take up to `Opts.stall_timeout` (60s unless set)
+instead of the request having `timeout` as a whole; `timeout` then counts again from when the body
+is sent. If the server responds before the whole body is sent (rejecting it, e.g. 413), the client
+stops sending and returns that response.
+*/
+Body_Source :: struct {
+	// Fills (the start of) `buf` with the next part of the body: `n` bytes, more than 0 unless
+	// `done`, which is set with the last part. Returning `ok = false` fails the request
+	// (`.Body_Source_Failed`).
+	read:      proc(buf: []byte, user_data: rawptr) -> (n: int, done: bool, ok: bool),
+	user_data: rawptr,
+	// The body's size in bytes, sent as Content-Length. -1 when it isn't known up front: then the
+	// body is sent with chunked transfer coding (which some servers don't accept for requests).
+	length:    int,
+	// Starts the body over from the beginning, called before it's sent. Optional: with it a
+	// request can go out on a reused (keep-alive) connection and be retried on a new one if that
+	// turns out to be closed (see `should_retry`); without it, it always gets a new connection.
+	rewind:    proc(user_data: rawptr) -> bool,
+}
+
+/*
+Sends the file at `path` as the request body (see `Body_Source`), read as it's sent; its size is the
+Content-Length. The file stays open until `request_destroy`, the request can be sent more than once.
+*/
+body_from_file :: proc(req: ^Request, path: string, allocator := context.allocator) -> os.Error {
+	f := os.open(path) or_return
+	size, err := os.file_size(f)
+	if err != nil {
+		os.close(f)
+		return err
+	}
+	if req._file != nil { file_source_destroy(req._file) }
+	fs := new(File_Source, allocator)
+	fs^ = {file = f, size = int(size), allocator = allocator}
+	req._file = fs
+
+	req.source = {
+		user_data = fs,
+		length    = fs.size,
+		read = proc(buf: []byte, user_data: rawptr) -> (n: int, done: bool, ok: bool) {
+			fs := (^File_Source)(user_data)
+			left := fs.size - fs.offset
+			if left == 0 { return 0, true, true }
+			n, _ = os.read_at(fs.file, buf[:min(len(buf), left)], i64(fs.offset))
+			// The file shrank since: the promised length can't be sent.
+			if n <= 0 { return 0, false, false }
+			fs.offset += n
+			return n, fs.offset == fs.size, true
+		},
+		rewind = proc(user_data: rawptr) -> bool {
+			(^File_Source)(user_data).offset = 0
+			return true
+		},
+	}
+	return nil
+}
+
+@(private)
+File_Source :: struct {
+	file:      ^os.File,
+	size:      int,
+	offset:    int,
+	allocator: mem.Allocator,
+}
+
+@(private)
+file_source_destroy :: proc(fs: ^File_Source) {
+	os.close(fs.file)
+	free(fs, fs.allocator)
 }
 
 // Initializes the request with sane defaults using the given allocator.
@@ -123,6 +212,8 @@ request_destroy :: proc(r: ^Request) {
 	delete(r.headers._kv)
 	delete(r.cookies)
 	bytes.buffer_destroy(&r.body)
+	if r._file != nil { file_source_destroy(r._file) }
+	r._file = nil
 }
 
 // Sets the body to `v` as JSON (and the method to POST if it was GET).
@@ -172,8 +263,9 @@ Sends `req` to `url` on the calling thread's nbio event loop. Returns right away
 this thread once the response is complete or the request failed.
 
 An error is returned (and `cb` isn't called) when the thread has no event loop, the URL or request
-is invalid, the host can't be resolved (resolution is blocking) or TLS can't be set up. `req` is serialized before this returns,
-it can be destroyed right away.
+is invalid, the host can't be resolved (resolution is blocking) or TLS can't be set up. `req` is
+serialized before this returns, it can be destroyed right away, unless it has a `source` (which is
+read until the request ended).
 
 `allocator` must be usable from the event loop's thread, it holds the response.
 */
@@ -264,7 +356,7 @@ RESERVED_HEADERS :: [?]string{"content-length", "transfer-encoding", "connection
 /*
 The request as sent: request line, headers (Host, User-Agent and Accept unless set, Connection:
 close unless `keep_alive`, Content-Length when there is a body or the method expects one), cookies,
-body. Header names must be tokens and values field-content, cookies must be valid: nothing is
+body (unless it comes from `source`). Header names must be tokens and values field-content, cookies must be valid: nothing is
 escaped, an invalid request is refused.
 */
 format_request :: proc(req: ^Request, t: Target, keep_alive := false, allocator := context.allocator) -> (out: []byte, err: Error) {
@@ -297,7 +389,16 @@ format_request :: proc(req: ^Request, t: Target, keep_alive := false, allocator 
 	if !keep_alive { strings.write_string(&sb, "connection: close\r\n") }
 
 	body_len := bytes.buffer_length(&req.body)
-	if body_len > 0 || req.method == .Post || req.method == .Put || req.method == .Patch {
+	if req.source.read != nil {
+		if body_len > 0 || req.source.length < -1 { return nil, .Invalid_Request }
+		if req.source.length == -1 {
+			strings.write_string(&sb, "transfer-encoding: chunked\r\n")
+		} else {
+			strings.write_string(&sb, "content-length: ")
+			strings.write_int(&sb, req.source.length)
+			strings.write_string(&sb, "\r\n")
+		}
+	} else if body_len > 0 || req.method == .Post || req.method == .Put || req.method == .Patch {
 		strings.write_string(&sb, "content-length: ")
 		strings.write_int(&sb, body_len)
 		strings.write_string(&sb, "\r\n")

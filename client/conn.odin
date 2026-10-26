@@ -6,6 +6,8 @@ import "core:mem"
 import "core:mem/virtual"
 import "core:nbio"
 import "core:net"
+import "core:strconv"
+import "core:sys/posix"
 import "core:time"
 
 import http ".."
@@ -14,9 +16,13 @@ import "../openssl"
 // Ciphertext / plaintext read at once.
 READ_SIZE :: 32 * 1024
 
+// A request body from a `Body_Source` is sent in parts of at most this.
+SOURCE_PART :: 64 * 1024
+
 /*
 One request in flight. Strictly sequential: connect (or take an idle connection from the pool),
-TLS handshake, write the request, read until the response is complete. So at most one nbio
+TLS handshake, write the request (a body from a `Body_Source` part by part), read until the
+response is complete. So at most one nbio
 operation is pending, and `finish` (which frees the request's state) is only ever called from a
 completion with nothing else in flight.
 */
@@ -61,6 +67,13 @@ Conn :: struct {
 	// A streamed response: the parser hands the head and body to these.
 	stream:      Stream,
 	stream_user: rawptr,
+
+	// The request body comes from here (`read` is nil otherwise), through `src_buf`.
+	source:      Body_Source,
+	src_buf:     []byte,
+	src_sent:    int,
+	// The last part is being sent.
+	src_done:    bool,
 }
 
 
@@ -82,6 +95,9 @@ start :: proc(req: ^Request, url: string, opts: Opts, user_data: rawptr, cb: Cal
 	c.allocator = allocator
 	c.stream      = stream
 	c.stream_user = stream_user
+	c.source      = req.source
+	// While the body is sent, `stall_timeout` bounds each write (see `Body_Source`).
+	if c.source.read != nil && c.opts.stall_timeout <= 0 { c.opts.stall_timeout = 60 * time.Second }
 	c.buf.allocator = allocator
 	c.out.allocator = allocator
 
@@ -103,7 +119,9 @@ start :: proc(req: ^Request, url: string, opts: Opts, user_data: rawptr, cb: Cal
 		c.parser.user_data = c
 	}
 
-	if c.key != "" {
+	// A body that can't be sent again isn't sent on a reused connection, which can turn out to be
+	// closed (see `should_retry`).
+	if c.key != "" && (c.source.read == nil || c.source.rewind != nil) {
 		if ic, ok := pool_get(c.key); ok {
 			adopt(c, ic)
 			send_request(c)
@@ -161,6 +179,7 @@ adopt :: proc(c: ^Conn, ic: Idle_Conn) {
 conn_free :: proc(c: ^Conn) {
 	if c.tls_ctx != nil { openssl.SSL_CTX_free(c.tls_ctx) }
 	delete(c.cin, c.allocator)
+	delete(c.src_buf, c.allocator)
 	delete(c.out)
 	delete(c.buf)
 	delete(c.request, c.allocator)
@@ -178,8 +197,8 @@ time_left :: proc(c: ^Conn) -> time.Duration {
 	return max(time.diff(nbio.now(), c.deadline), time.Millisecond)
 }
 
-// How long one read may wait: what's left of the deadline, at most `stall_timeout`.
-read_timeout :: proc(c: ^Conn) -> time.Duration {
+// How long one read or write may wait: what's left of the deadline, at most `stall_timeout`.
+io_timeout :: proc(c: ^Conn) -> time.Duration {
 	t := time_left(c)
 	if c.opts.stall_timeout > 0 { t = min(t, c.opts.stall_timeout) }
 	return t
@@ -269,7 +288,7 @@ flush :: proc(c: ^Conn, next: proc(c: ^Conn)) {
 			return
 		}
 		c.after_flush(c)
-	}, all = true, timeout = time_left(c))
+	}, all = true, timeout = io_timeout(c))
 }
 
 // Reads ciphertext into `rbio`, then calls `next`.
@@ -287,7 +306,7 @@ read_cipher :: proc(c: ^Conn, next: proc(c: ^Conn)) {
 		}
 		openssl.BIO_write(c.rbio, raw_data(c.cin), i32(op.recv.received))
 		c.after_flush(c)
-	}, timeout = read_timeout(c))
+	}, timeout = io_timeout(c))
 }
 
 // --- Request ---
@@ -300,7 +319,7 @@ send_request :: proc(c: ^Conn) {
 				on_send_error(c, op.send.err)
 				return
 			}
-			read_response(c)
+			after_head(c)
 		}, all = true, timeout = time_left(c))
 		return
 	}
@@ -315,7 +334,151 @@ send_request :: proc(c: ^Conn) {
 		}
 	}
 	openssl.drain_bio(c.wbio, &c.out)
-	flush(c, read_response)
+	flush(c, after_head)
+}
+
+// The request head (and a body from memory) is sent.
+after_head :: proc(c: ^Conn) {
+	if c.source.read == nil {
+		read_response(c)
+		return
+	}
+	// From the start (a request sent again, or retried).
+	if c.source.rewind != nil && !c.source.rewind(c.source.user_data) {
+		finish(c, .Body_Source_Failed)
+		return
+	}
+	// From here each write has `stall_timeout`, however long the whole body takes.
+	c.deadline = time.time_add(nbio.now(), 365 * 24 * time.Hour)
+	c.src_sent = 0
+	c.src_done = false
+	if c.src_buf == nil { c.src_buf = make([]byte, SOURCE_PART, c.allocator) }
+	send_part(c)
+}
+
+/*
+Sends the next part of the body from the `Body_Source`. Chunked (the length isn't known) each part
+is a chunk, the chunk header written in front of the data in `src_buf`, the last chunk behind it.
+*/
+send_part :: proc(c: ^Conn) {
+	if early_response(c) { return }
+
+	chunked := c.source.length == -1
+	HEAD :: 8 // "ffff\r\n" for a part of up to 64 KiB, and room to spare.
+	TAIL :: 7 // "\r\n" + "0\r\n\r\n"
+	data := c.src_buf[HEAD:len(c.src_buf) - TAIL] if chunked else c.src_buf[:]
+
+	n, done, ok := c.source.read(data, c.source.user_data)
+	switch {
+	case !ok:
+		log.debug("client: the body source failed")
+		finish(c, .Body_Source_Failed)
+		return
+	case n < 0 || n > len(data) || (n == 0 && !done):
+		log.warnf("client: the body source returned %i bytes (done=%v) for a %i byte buffer", n, done, len(data))
+		finish(c, .Body_Source_Failed)
+		return
+	}
+	c.src_sent += n
+	if !chunked && c.src_sent == c.source.length && !done {
+		// All of `length` is there: make sure that's all, before the server has its complete body
+		// (and answers) and the client never asks again.
+		probe: [1]byte
+		extra, probe_done, probe_ok := c.source.read(probe[:], c.source.user_data)
+		if !probe_ok || extra < 0 || extra > 1 || (extra == 0 && !probe_done) {
+			finish(c, .Body_Source_Failed)
+			return
+		}
+		c.src_sent += extra
+		done = true
+	}
+	c.src_done = done
+	if !chunked && (c.src_sent > c.source.length || (done && c.src_sent != c.source.length)) {
+		log.warnf("client: the body source produced %s bytes than its length %i", "more" if c.src_sent > c.source.length else "fewer", c.source.length)
+		finish(c, .Body_Source_Failed)
+		return
+	}
+
+	part := c.src_buf[:n]
+	if chunked {
+		start, end := HEAD, HEAD + n
+		if n > 0 {
+			hex: [16]byte
+			size := strconv.write_int(hex[:], i64(n), 16)
+			start -= len(size) + 2
+			copy(c.src_buf[start:], size)
+			copy(c.src_buf[start + len(size):], "\r\n")
+			end += copy(c.src_buf[end:], "\r\n")
+		}
+		if done { end += copy(c.src_buf[end:], "0\r\n\r\n") }
+		part = c.src_buf[start:end]
+	}
+
+	if c.ssl == nil {
+		nbio.send_poly(c.socket, {part}, c, proc(op: ^nbio.Operation, c: ^Conn) {
+			if op.send.err != nil {
+				on_send_error(c, op.send.err)
+				return
+			}
+			part_sent(c)
+		}, all = true, timeout = io_timeout(c))
+		return
+	}
+
+	openssl.ERR_clear_error()
+	if len(part) > 0 {
+		if r := openssl.SSL_write(c.ssl, raw_data(part), i32(len(part))); int(r) != len(part) {
+			log.infof("client: TLS write failed: %s", openssl.error_string())
+			finish(c, .TLS_Failed)
+			return
+		}
+	}
+	openssl.drain_bio(c.wbio, &c.out)
+	flush(c, part_sent)
+}
+
+part_sent :: proc(c: ^Conn) {
+	if !c.src_done {
+		send_part(c)
+		return
+	}
+	// All sent: `timeout` counts for the response from now.
+	c.deadline = time.time_add(nbio.now(), c.opts.timeout)
+	read_response(c)
+}
+
+/*
+Whether the server sent something before the body is complete: then it's the response (rejecting
+the upload, e.g. 413) or the connection closing, and the client stops sending and reads it. Over
+TLS, what arrived may also be just a session ticket, then sending carries on.
+*/
+early_response :: proc(c: ^Conn) -> bool {
+	if !socket_readable(c.socket) { return false }
+	if c.ssl == nil {
+		log.debug("client: response before the body was sent, stopping")
+		c.send_failed = true
+		read_response(c)
+		return true
+	}
+	read_cipher(c, proc(c: ^Conn) {
+		openssl.ERR_clear_error()
+		b: [1]byte
+		r := openssl.SSL_peek(c.ssl, &b[0], 1)
+		if r <= 0 && openssl.SSL_get_error(c.ssl, r) == openssl.SSL_ERROR_WANT_READ {
+			log.debug("client: TLS records but no response while sending the body, carrying on")
+			send_part(c)
+			return
+		}
+		log.debug("client: response before the body was sent, stopping")
+		c.send_failed = true
+		read_tls(c)
+	})
+	return true
+}
+
+socket_readable :: proc(socket: net.TCP_Socket) -> bool {
+	fds := [1]posix.pollfd{{fd = posix.FD(socket), events = {.IN}}}
+	return posix.poll(&fds[0], 1, 0) > 0
 }
 
 /*
@@ -358,7 +521,7 @@ read_response :: proc(c: ^Conn) {
 		non_zero_resize(&c.buf, len(c.buf) + op.recv.received)
 		c.got_bytes = true
 		feed(c)
-	}, timeout = read_timeout(c))
+	}, timeout = io_timeout(c))
 }
 
 read_tls :: proc(c: ^Conn) {
@@ -505,6 +668,7 @@ sent again on a new connection, once, if repeating it is safe (an idempotent met
 */
 should_retry :: proc(c: ^Conn, err: Error) -> bool {
 	if !c.reused || c.got_bytes || expired(c) { return false }
+	if c.source.read != nil && c.source.rewind == nil { return false }
 	#partial switch err {
 	case .Connection_Closed, .Network_Error, .TLS_Failed:
 	case:
@@ -526,6 +690,11 @@ retry :: proc(c: ^Conn) {
 	clear(&c.buf)
 	c.reused = false
 	c.send_failed = false
+	if c.source.read != nil {
+		// The body was (being) sent, so `deadline` was set far ahead: start over (the body too,
+		// see `after_head`).
+		c.deadline = time.time_add(nbio.now(), c.opts.timeout)
+	}
 	if err := connect(c); err != nil {
 		finish(c, err)
 	}

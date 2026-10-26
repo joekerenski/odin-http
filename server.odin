@@ -64,6 +64,11 @@ Server_Opts :: struct {
 	header_timeout:          time.Duration,
 	// How long a body read may go without receiving any data. Defaults to 30 seconds.
 	body_read_timeout:       time.Duration,
+	// The slowest a body may arrive on average, in bytes per second, so a client can't hold a
+	// connection by trickling a byte every few seconds. A body gets `body_read_timeout` of grace
+	// at the start, and can bank at most that much ahead by sending faster. Time a handler spends
+	// on a piece of a streamed body (see `body_stream`) doesn't count. Defaults to 500.
+	body_min_rate:           int,
 	// How long a response write may go without making any progress. Defaults to 30 seconds.
 	write_timeout:           time.Duration,
 	// How long a graceful shutdown waits for active requests before forcefully closing their
@@ -84,6 +89,7 @@ Default_Server_Opts := Server_Opts {
 	idle_timeout            = 3 * time.Minute,
 	header_timeout          = 30 * time.Second,
 	body_read_timeout       = 30 * time.Second,
+	body_min_rate           = 500,
 	write_timeout           = 30 * time.Second,
 	shutdown_timeout        = 30 * time.Second,
 }
@@ -171,6 +177,7 @@ listen :: proc(
 	if s.opts.idle_timeout       == 0 { s.opts.idle_timeout       = Default_Server_Opts.idle_timeout }
 	if s.opts.header_timeout     == 0 { s.opts.header_timeout     = Default_Server_Opts.header_timeout }
 	if s.opts.body_read_timeout  == 0 { s.opts.body_read_timeout  = Default_Server_Opts.body_read_timeout }
+	if s.opts.body_min_rate      == 0 { s.opts.body_min_rate      = Default_Server_Opts.body_min_rate }
 	if s.opts.write_timeout      == 0 { s.opts.write_timeout      = Default_Server_Opts.write_timeout }
 	if s.opts.shutdown_timeout   == 0 { s.opts.shutdown_timeout   = Default_Server_Opts.shutdown_timeout }
 	s.conn_allocator = context.allocator
@@ -388,6 +395,8 @@ _server_thread_shutdown :: proc(s: ^Server, loc := #caller_location) {
 				connection_close(conn)
 			case .Closing:
 				log.debugf("shutdown: connection %i is closing", sock)
+				// Don't wait for a lingering client.
+				if conn.lingering { net.shutdown(sock, .Receive) }
 			case .Closed:
 				log.warn("closed connection in connections map, maybe a race or logic error")
 			}
@@ -473,6 +482,11 @@ Max_Post_Handler_Discard_Bytes :: 256 << 10
 @(private)
 Conn_Close_Delay :: time.Millisecond * 500
 
+// How long a closing connection reads and discards what the client still sends, see
+// `connection_close`.
+@(private)
+Conn_Linger_Time :: 2 * time.Second
+
 Connection_State :: enum {
 	Pending, // Pending a client to attach.
 	New, // Got client, waiting to service first request.
@@ -523,6 +537,8 @@ Connection :: struct {
 	tls:            ^TLS_Conn,
 	// The pending plain read, see `connection_recv`.
 	recv_done:      Recv_Done,
+	// Closing: reading and discarding until the client closes too, see `connection_close`.
+	lingering:      bool,
 	// State of a pending "100 Continue" write.
 	continue_state: rawptr,
 	// Set once the connection is hijacked, see `response_hijack`.
@@ -612,7 +628,50 @@ connection_close :: proc(c: ^Connection, loc := #caller_location) {
 		net.shutdown(c.socket, net.Shutdown_Manner.Send)
 	}
 
+	/*
+	A lingering close (RFC 9112 9.6): read and discard what the client still sends until it closes
+	too, for a while. Closing a socket with unread data makes the kernel reset the connection, and
+	a reset can wipe out the response before the client read it: e.g. a 413 for an upload the client
+	is still sending. Not while a read is pending (it's an idle connection then, nothing to wait
+	for) or the server is shutting down.
+	*/
+	reading := c.recv_done != nil || (c.tls != nil && c.tls.reading)
+	if !reading && !atomic_load(&c.server.closing) {
+		if len(c.scanner.buf) == 0 {
+			// A hijacked connection's scanner is gone: the same allocator as `scanner_init`.
+			if c.scanner.buf.allocator.procedure == nil { c.scanner.buf.allocator = c.server.conn_allocator }
+			resize(&c.scanner.buf, INIT_BUF_SIZE)
+		}
+		c.lingering = true
+		connection_linger(c, time.time_add(nbio.now(), Conn_Linger_Time))
+		return
+	}
+
 	nbio.timeout_poly(Conn_Close_Delay, c, connection_finish_close)
+}
+
+@(private)
+connection_linger :: proc(c: ^Connection, until: time.Time) {
+	left := time.diff(nbio.now(), until)
+	if left <= 0 {
+		connection_linger_done(c)
+		return
+	}
+	nbio.recv_poly2(c.socket, {c.scanner.buf[:]}, c, until, proc(op: ^nbio.Operation, c: ^Connection, until: time.Time) {
+		if op.recv.err != nil || op.recv.received == 0 {
+			connection_linger_done(c)
+			return
+		}
+		connection_linger(c, until)
+	}, timeout = left)
+}
+
+@(private="file")
+connection_linger_done :: proc(c: ^Connection) {
+	// Cleared before the socket is closed: from then on its descriptor can belong to another
+	// connection, which the shutdown (that ends lingering, see `_server_thread_shutdown`) must not touch.
+	c.lingering = false
+	connection_finish_close(nil, c)
 }
 
 // Closes the socket and frees the connection, once the TLS layer has nothing in flight.

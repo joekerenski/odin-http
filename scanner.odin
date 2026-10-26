@@ -54,8 +54,13 @@ Scanner :: struct /* #no_copy */ {
 	read_timeout:                 time.Duration,
 	// Absolute deadline for the reads, zero for none.
 	deadline:                     time.Time,
-	// Set when a read failed because of `read_timeout` or `deadline`; the callback gets `.Unknown`.
-	// Both are enforced by the thread's sweeper (`server_sweep`), up to `sweep_interval` late.
+	// Minimum average transfer rate in bytes per second, <= 0 for none: `rate_deadline` moves
+	// ahead by the time each received byte buys, at most `read_timeout` past now.
+	min_rate:                     int,
+	rate_deadline:                time.Time,
+	// Set when a read failed because of `read_timeout`, `deadline` or `rate_deadline`; the callback
+	// gets `.Unknown`. They are enforced by the thread's sweeper (`server_sweep`), up to
+	// `sweep_interval` late.
 	timed_out:                    bool,
 }
 
@@ -92,7 +97,23 @@ scanner_reset :: proc(s: ^Scanner) {
 	s.callback                     = nil
 	s.read_timeout                 = 0
 	s.deadline                     = {}
+	s.min_rate                     = 0
+	s.rate_deadline                = {}
 	s.timed_out                    = false
+}
+
+// Starts enforcing `min_rate` from now on, with a grace of `read_timeout`.
+scanner_start_rate :: proc(s: ^Scanner, min_rate: int) {
+	if min_rate <= 0 || s.read_timeout <= 0 { return }
+	s.min_rate      = min_rate
+	s.rate_deadline = time.time_add(nbio.now(), s.read_timeout)
+}
+
+// Time the scanner wasn't reading (e.g. a handler processing a piece of a streamed body) doesn't
+// count against the minimum rate.
+scanner_pause_rate :: proc(s: ^Scanner, paused: time.Duration) {
+	if s.min_rate <= 0 || paused <= 0 { return }
+	s.rate_deadline = time.time_add(s.rate_deadline, paused)
 }
 
 scanner_scan :: proc(
@@ -187,6 +208,18 @@ scanner_scan :: proc(
 
 	could_be_too_short := false
 
+	if s.start > 0 && s.start == s.end {
+		s.start, s.end = 0, 0
+	}
+
+	// Reuse the space of what was consumed before growing the buffer. Tokens handed out earlier
+	// are only valid until the next scan, so nothing points into it anymore.
+	if s.end == len(s.buf) && s.start > 0 {
+		copy(s.buf[:], s.buf[s.start:s.end])
+		s.end  -= s.start
+		s.start = 0
+	}
+
 	// Resize the buffer if full
 	if s.end == len(s.buf) {
 		if s.max_token_size <= 0 {
@@ -198,8 +231,6 @@ scanner_scan :: proc(
 			callback(user_data, "", s._err)
 			return
 		}
-
-		// TODO: write over the part of the buffer already used
 
 		// overflow check
 		new_size := INIT_BUF_SIZE
@@ -234,6 +265,9 @@ scanner_scan :: proc(
 		if deadline == {} || time.diff(per_read, deadline) > 0 {
 			deadline = per_read
 		}
+	}
+	if s.min_rate > 0 && (deadline == {} || time.diff(s.rate_deadline, deadline) > 0) {
+		deadline = s.rate_deadline
 	}
 	if deadline != {} && time.diff(now, deadline) <= 0 {
 		s.timed_out = true
@@ -286,4 +320,11 @@ scanner_on_read :: proc(s: ^Scanner, received: int, status: Recv_Status) {
 
 	s.end += received
 	s.successive_empty_token_count = 0
+
+	if s.min_rate > 0 {
+		now    := nbio.now()
+		earned := time.time_add(s.rate_deadline, time.Duration(i64(received) * i64(time.Second) / i64(s.min_rate)))
+		limit  := time.time_add(now, s.read_timeout)
+		s.rate_deadline = earned if time.diff(earned, limit) > 0 else limit
+	}
 }

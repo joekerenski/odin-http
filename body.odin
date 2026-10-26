@@ -30,7 +30,7 @@ Do not call this more than once.
 **Tip** If an error is returned, easily respond with an appropriate error code like this, `http.respond(res, http.body_error_status(err))`.
 */
 body :: proc(req: ^Request, max_length: int = -1, user_data: rawptr, cb: Body_Callback) {
-	assert(req._body_ok == nil, "you can only call body once per request")
+	assert(req._body_ok == nil, "you can only call body (or body_stream) once per request")
 
 	limit := req._scanner.connection.server.opts.max_body_size
 	if max_length > -1 && max_length < limit {
@@ -61,6 +61,7 @@ body :: proc(req: ^Request, max_length: int = -1, user_data: rawptr, cb: Body_Ca
 
 @(private)
 _body_start :: proc(req: ^Request, limit: int, user_data: rawptr, cb: Body_Callback) {
+	scanner_start_rate(req._scanner, req._scanner.connection.server.opts.body_min_rate)
 	switch req._framing {
 	case .None:    unreachable()
 	case .Length:  _body_length(req, user_data, cb)
@@ -322,26 +323,9 @@ _body_chunked :: proc(req: ^Request, max_length: int, user_data: rawptr, cb: Bod
 			return
 		}
 
-		s.trailer_bytes_left -= len(line) + 2
-		s.trailer_count      += 1
-		opts := s.req._scanner.connection.server.opts
-		if s.trailer_bytes_left < 0 || s.trailer_count > opts.limit_header_count {
-			log.info("trailer section too large")
-			fail(s, .Too_Long)
+		if terr := _body_trailer_line(s.req, line, &s.trailer_bytes_left, &s.trailer_count); terr != nil {
+			fail(s, terr)
 			return
-		}
-
-		key, ok := header_parse(&s.req.trailers, line)
-		if !ok {
-			log.infof("Invalid trailer field when decoding chunked body: %q", line)
-			fail(s, .Bad_Read_Count)
-			return
-		}
-
-		// A recipient MUST ignore (or consider as an error) any fields that are forbidden to be sent in a trailer.
-		if !header_allowed_trailer(key) {
-			log.infof("Invalid trailer header received, discarding it: %q", key)
-			headers_delete_unsafe(&s.req.trailers, key)
 		}
 
 		s.req._scanner.max_token_size = max(s.trailer_bytes_left, 1)
@@ -369,4 +353,29 @@ _body_chunked :: proc(req: ^Request, max_length: int, user_data: rawptr, cb: Bod
 	s.cb         = cb
 
 	scan_size_line(s)
+}
+
+// Adds a trailer field line of a chunked body to `req.trailers`, within the header limits.
+@(private)
+_body_trailer_line :: proc(req: ^Request, line: string, bytes_left, count: ^int) -> Body_Error {
+	bytes_left^ -= len(line) + 2
+	count^      += 1
+	opts := req._scanner.connection.server.opts
+	if bytes_left^ < 0 || count^ > opts.limit_header_count {
+		log.info("trailer section too large")
+		return .Too_Long
+	}
+
+	key, ok := header_parse(&req.trailers, line)
+	if !ok {
+		log.infof("Invalid trailer field when decoding chunked body: %q", line)
+		return .Bad_Read_Count
+	}
+
+	// A recipient MUST ignore (or consider as an error) any fields that are forbidden to be sent in a trailer.
+	if !header_allowed_trailer(key) {
+		log.infof("Invalid trailer header received, discarding it: %q", key)
+		headers_delete_unsafe(&req.trailers, key)
+	}
+	return nil
 }

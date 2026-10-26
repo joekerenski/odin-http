@@ -5,7 +5,6 @@ import "base:runtime"
 import "core:fmt"
 import "core:net"
 import "core:sync"
-import "core:sys/posix"
 import "core:time"
 
 import "../openssl"
@@ -174,8 +173,7 @@ it shouldn't have, e.g. a close_notify or a 408), either way it can't be used.
 */
 @(private="file")
 idle_alive :: proc(ic: Idle_Conn) -> bool {
-	fds := [1]posix.pollfd{{fd = posix.FD(ic.socket), events = {.IN}}}
-	return posix.poll(&fds[0], 1, 0) == 0
+	return !socket_readable(ic.socket)
 }
 
 @(private)
