@@ -3,17 +3,12 @@ package openssl
 import "core:c"
 import "core:c/libc"
 
-// Links the system OpenSSL (3.x). macOS and Linux only.
-when ODIN_OS == .Darwin {
-	foreign import lib {
-		"system:ssl.3",
-		"system:crypto.3",
-	}
-} else {
-	foreign import lib {
-		"system:ssl",
-		"system:crypto",
-	}
+// Links the system OpenSSL, 3.x or later (4.x has every function used here). macOS and Linux
+// only. Where it isn't on the linker's path (Homebrew keeps it in its own prefix), the app's
+// build adds it: -extra-linker-flags:"-L$(brew --prefix openssl)/lib".
+foreign import lib {
+	"system:ssl",
+	"system:crypto",
 }
 
 Version :: bit_field u32 {
@@ -28,7 +23,7 @@ VERSION: Version
 @(private, init)
 version_check :: proc "contextless" () {
 	VERSION = Version(OpenSSL_version_num())
-	assert_contextless(VERSION.major == 3, "invalid OpenSSL library version, expected 3.x")
+	assert_contextless(VERSION.major >= 3, "invalid OpenSSL library version, expected 3.x or later")
 }
 
 SSL_METHOD :: struct {}

@@ -35,12 +35,15 @@ themselves and always verify certificates.
 
 ## Installation
 
-Needs a recent Odin (developed against `dev-2026-08`), OpenSSL 3 and zlib:
+Needs a recent Odin (developed against `dev-2026-08`), OpenSSL 3 or later, and zlib:
 
 ```sh
-brew install openssl@3                  # macOS (zlib comes with the OS)
+brew install openssl                    # macOS (zlib comes with the OS)
 sudo apt install libssl-dev zlib1g-dev  # Debian/Ubuntu
 ```
+
+Homebrew keeps OpenSSL in its own prefix, off the linker's path, so on macOS a build adds it:
+`-extra-linker-flags:"-L$(brew --prefix openssl)/lib"` (`scripts/test.sh` does).
 
 Odin has no package manager: put the repository somewhere and import it, either through a collection or
 by path.

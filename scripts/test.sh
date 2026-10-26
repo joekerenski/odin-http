@@ -39,6 +39,10 @@ trap 'exit 130' INT TERM
 
 # Leaks and bad frees fail the test that caused them.
 DEFS="-define:ODIN_TEST_LOG_LEVEL=warning -define:ODIN_TEST_FAIL_ON_BAD_MEMORY=true -define:ODIN_TEST_FANCY=false"
+# Homebrew keeps OpenSSL in its own prefix, off the linker's path.
+if command -v brew >/dev/null 2>&1 && SSL_PREFIX=$(brew --prefix openssl 2>/dev/null) && [ -d "$SSL_PREFIX/lib" ]; then
+	DEFS="$DEFS -extra-linker-flags:-L$SSL_PREFIX/lib"
+fi
 failed=()
 
 step() {
